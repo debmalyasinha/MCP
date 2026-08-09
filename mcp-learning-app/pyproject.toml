@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-learning-app"
+version = "0.1.0"
+description = "A small Python app for learning MCP tools, resources, prompts, and clients"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]>=2,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9"]
+
+[project.scripts]
+mcp-study-server = "mcp_learning_app.server:main"
+mcp-study-client = "mcp_learning_app.client:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_learning_app"]
+
+[tool.pytest.ini_options]
+addopts = "-p no:cacheprovider"
+pythonpath = ["src"]
+testpaths = ["tests"]
