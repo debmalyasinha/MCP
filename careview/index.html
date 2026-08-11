@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#164f43" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="Careview" />
+    <meta name="format-detection" content="telephone=no" />
+    <meta
+      name="description"
+      content="Careview helps caregivers use AI-assisted review of consented home-scene images and short videos for food, medication, and household safety observations."
+    />
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="icon" href="icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png" />
+    <link rel="stylesheet" href="styles.css" />
+    <title>Careview — Notice what changed</title>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="app-header" id="app-header">
+        <button class="brand" type="button" data-route="home" aria-label="Careview home">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M12 21s8-3.6 8-10V5.7L12 3 4 5.7V11c0 6.4 8 10 8 10Z"/><path d="M8.8 12.1 11 14.3l4.5-4.8"/></svg>
+          </span>
+          <span>careview</span>
+        </button>
+        <button class="avatar-button" type="button" data-route="care" aria-label="Open Margaret's care profile">
+          <span>ME</span>
+          <span class="presence-dot" aria-hidden="true"></span>
+        </button>
+      </header>
+
+      <main id="app" tabindex="-1"></main>
+
+      <nav class="bottom-nav" aria-label="Primary navigation">
+        <button class="nav-item active" type="button" data-route="home" aria-current="page">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3.5 10 8.5-7 8.5 7v10.5h-6v-6h-5v6h-5Z"/></svg>
+          <span>Home</span>
+        </button>
+        <button class="nav-item" type="button" data-route="history">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V9m5 10V5m5 14v-7m5 7V3"/></svg>
+          <span>Trends</span>
+        </button>
+        <button class="nav-item" type="button" data-route="care">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11.2c0 5-8 9.1-8 9.1S4 16.2 4 11.2A4.2 4.2 0 0 1 11.7 9l.3.5.3-.5a4.2 4.2 0 0 1 7.7 2.2Z"/></svg>
+          <span>Care</span>
+        </button>
+      </nav>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <div class="sheet-backdrop" id="sheet-backdrop" hidden></div>
+    <section class="bottom-sheet" id="bottom-sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title" hidden></section>
+
+    <noscript>
+      <p class="noscript">Careview needs JavaScript enabled to run this interactive prototype.</p>
+    </noscript>
+    <script src="app.js" defer></script>
+  </body>
+</html>
