@@ -23,22 +23,22 @@ One image or one video counts as one scene check. Multiple frames from the same 
 
 The server uses Python's standard library, so no Python package installation is required. An OpenAI API key with available API billing is required for real AI analysis. Never put that key in `app.js`, a URL, or the iPhone.
 
-From PowerShell in `C:\Work`, read the key without displaying it and start the server:
+Store the API key once as the `careview` secret in the password-protected
+`CareviewVault`. Then start the server from PowerShell in `C:\Work` with:
 
 ```powershell
-$careviewKey = Read-Host "OpenAI API key" -AsSecureString
-$env:OPENAI_API_KEY = [System.Net.NetworkCredential]::new("", $careviewKey).Password
-$env:OPENAI_MODEL = "gpt-5.6-terra"
-python careview\server.py --bind 127.0.0.1 --port 4173
+.\careview\scripts\start-careview.ps1
 ```
 
-Open [http://127.0.0.1:4173](http://127.0.0.1:4173). Stop the server with `Ctrl+C`. Then remove the key from that PowerShell process:
+The launcher retrieves the saved secret, exposes it only to the server process,
+and removes it from the PowerShell process when the server stops. The vault may
+prompt for its unlock password, but the OpenAI API key does not need to be
+entered again. Open [http://127.0.0.1:4173](http://127.0.0.1:4173) and stop the
+server with `Ctrl+C`.
 
-```powershell
-Remove-Item Env:OPENAI_API_KEY
-Remove-Item Env:OPENAI_MODEL
-Remove-Variable careviewKey
-```
+Under the hood, the launcher sets `OPENAI_API_KEY` only for the process and runs
+`python careview\server.py`; use the launcher so the key is never typed or stored
+in the repository.
 
 `OPENAI_MODEL` is optional; the server defaults to `gpt-5.6-terra`.
 
@@ -48,9 +48,7 @@ For test media only, bind the server to the local network:
 
 ```powershell
 cd C:\Work
-$careviewKey = Read-Host "OpenAI API key" -AsSecureString
-$env:OPENAI_API_KEY = [System.Net.NetworkCredential]::new("", $careviewKey).Password
-python careview\server.py --bind 0.0.0.0 --port 4173
+.\careview\scripts\start-careview.ps1 -Lan
 ```
 
 Find the computer's Wi-Fi IPv4 address with `ipconfig`. Connect both devices to the same trusted, non-guest Wi-Fi and open this form of address in iPhone Safari:
@@ -161,7 +159,8 @@ careview/
 |-- icon-512.png          # install and maskable icon
 |-- apple-touch-icon.png  # iOS Home Screen icon
 |-- scripts/
-|   `-- generate-icons.ps1
+|   |-- generate-icons.ps1
+|   `-- start-careview.ps1 # loads the API key from CareviewVault and starts the server
 `-- tests/
     |-- test_server.py
     `-- test_static_app.py

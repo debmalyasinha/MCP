@@ -2,4 +2,6 @@ __pycache__/
 *.py[cod]
 server.log
 server-error.log
+careview-server.stdout.log
+careview-server.stderr.log
 .env
