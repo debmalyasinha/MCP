@@ -13,13 +13,17 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import hashlib
+import hmac
 from http.cookies import CookieError, SimpleCookie
 import ipaddress
 import json
 import mimetypes
 import os
 import re
+import secrets
 import socket
+import stat
 import sys
 import threading
 import time
@@ -53,6 +57,7 @@ MAX_TOTAL_FRAME_BYTES = 12 * 1024 * 1024
 MAX_UPSTREAM_RESPONSE_BYTES = 1024 * 1024
 MAX_VIDEO_TIMESTAMP_MS = 30_000
 MAX_VIDEO_FRAMES = 6
+MAX_ANALYSIS_EDGE = 1280
 MAX_FINDINGS = 6
 MAX_LIMITATIONS = 6
 MAX_AUTH_REQUEST_BYTES = 16 * 1024
@@ -61,6 +66,8 @@ SESSION_COOKIE_NAME = "careview_session"
 SESSION_COOKIE_MAX_AGE = 8 * 60 * 60
 LOGIN_WINDOW_SECONDS = 5 * 60
 LOGIN_ATTEMPT_LIMIT = 10
+SETUP_TOKEN_HEADER = "X-Careview-Setup-Token"
+INSTANCE_LOCK_FILENAME = ".careview-instance.lock"
 
 ALLOWED_ZONES = {"kitchen", "fridge", "medication", "living"}
 ZONE_LABELS = {
@@ -70,7 +77,7 @@ ZONE_LABELS = {
     "living": "Living space",
 }
 ALLOWED_MEDIA_TYPES = {"image", "video"}
-ALLOWED_IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+ALLOWED_IMAGE_MIMES = {"image/jpeg"}
 SAFE_STATIC_FILES = {
     "index.html",
     "styles.css",
@@ -84,7 +91,7 @@ SAFE_STATIC_FILES = {
 }
 
 DATA_URL_RE = re.compile(
-    r"\Adata:(image/(?:jpeg|png|webp|gif));base64,([A-Za-z0-9+/]*={0,2})\Z",
+    r"\Adata:(image/jpeg);base64,([A-Za-z0-9+/]*={0,2})\Z",
     re.IGNORECASE,
 )
 MODEL_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,99}\Z")
@@ -166,9 +173,86 @@ class UpstreamConfigurationError(UpstreamResponseError):
     """The AI service rejected the configured server credentials."""
 
 
+class EvidenceStorageError(RuntimeError):
+    """Prepared evidence frames could not be safely persisted or read."""
+
+
+class CareviewInstanceLock:
+    """An OS-released lock that prevents two processes using one data root."""
+
+    def __init__(self, directory: Path):
+        directory.mkdir(parents=True, exist_ok=True)
+        self.path = directory / INSTANCE_LOCK_FILENAME
+        if self.path.is_symlink():
+            raise RuntimeError("The Careview instance lock cannot be a symbolic link.")
+        self._file = self.path.open("a+b")
+        self._locked = False
+        try:
+            self._file.seek(0, os.SEEK_END)
+            if self._file.tell() == 0:
+                self._file.write(b"\0")
+                self._file.flush()
+            self._file.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._locked = True
+            self._file.seek(0)
+            self._file.truncate()
+            self._file.write(f"pid={os.getpid()}\n".encode("ascii"))
+            self._file.flush()
+        except (OSError, BlockingIOError) as exc:
+            self._file.close()
+            raise RuntimeError(
+                f"Another Careview process is already using data root: {directory}"
+            ) from exc
+
+    def close(self) -> None:
+        if self._file.closed:
+            return
+        try:
+            if self._locked:
+                self._file.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._locked = False
+            self._file.close()
+
+
+class CareviewHTTPServer(ThreadingHTTPServer):
+    """HTTP server that owns the data-root lock for its full lifetime."""
+
+    def __init__(self, *args: Any, instance_lock: CareviewInstanceLock, **kwargs: Any):
+        self.instance_lock = instance_lock
+        try:
+            super().__init__(*args, **kwargs)
+        except Exception:
+            instance_lock.close()
+            raise
+
+    def server_close(self) -> None:
+        try:
+            super().server_close()
+        finally:
+            self.instance_lock.close()
+
+
 @dataclass(frozen=True)
 class ValidatedFrame:
     data_url: str
+    data: bytes
     mime_type: str
     timestamp_ms: int | None
     width: int | None
@@ -188,30 +272,422 @@ def _is_number(value: Any) -> bool:
 
 
 def _validate_dimension(value: Any, field: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 7680:
-        raise RequestValidationError(f"{field} must be an integer from 1 to 7680.")
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= MAX_ANALYSIS_EDGE
+    ):
+        raise RequestValidationError(
+            f"{field} must be an integer from 1 to {MAX_ANALYSIS_EDGE}."
+        )
     return value
 
 
-def _has_expected_image_signature(data: bytes, mime_type: str) -> bool:
-    if mime_type == "image/jpeg":
-        return data.startswith(b"\xff\xd8\xff")
-    if mime_type == "image/png":
-        return data.startswith(b"\x89PNG\r\n\x1a\n")
-    if mime_type == "image/webp":
-        return len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP"
-    if mime_type == "image/gif":
-        return data.startswith((b"GIF87a", b"GIF89a"))
-    return False
+class _JpegBitReader:
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.bit_offset = 0
+
+    def read_bit(self) -> int:
+        if self.bit_offset >= len(self.data) * 8:
+            raise RequestValidationError("Frame JPEG entropy data is truncated.")
+        byte = self.data[self.bit_offset // 8]
+        shift = 7 - (self.bit_offset % 8)
+        self.bit_offset += 1
+        return (byte >> shift) & 1
+
+    def skip_bits(self, count: int) -> None:
+        if count < 0 or self.bit_offset + count > len(self.data) * 8:
+            raise RequestValidationError("Frame JPEG entropy data is truncated.")
+        self.bit_offset += count
+
+    def require_fill_bits(self) -> None:
+        remaining = len(self.data) * 8 - self.bit_offset
+        if remaining > 7:
+            raise RequestValidationError("Frame JPEG contains unused entropy data.")
+        while self.bit_offset < len(self.data) * 8:
+            if self.read_bit() != 1:
+                raise RequestValidationError("Frame JPEG has invalid entropy padding.")
 
 
-def _decode_data_url(value: Any) -> tuple[str, int]:
+def _parse_jpeg_quantization_tables(
+    payload: bytes, tables: set[int]
+) -> None:
+    offset = 0
+    while offset < len(payload):
+        descriptor = payload[offset]
+        offset += 1
+        precision = descriptor >> 4
+        table_id = descriptor & 0x0F
+        if precision not in {0, 1} or table_id > 3 or table_id in tables:
+            raise RequestValidationError("Frame JPEG has invalid quantization tables.")
+        value_bytes = 1 if precision == 0 else 2
+        table_size = 64 * value_bytes
+        if offset + table_size > len(payload):
+            raise RequestValidationError("Frame JPEG has a truncated quantization table.")
+        values = payload[offset : offset + table_size]
+        if value_bytes == 1:
+            if 0 in values:
+                raise RequestValidationError("Frame JPEG has an invalid quantization value.")
+        else:
+            if any(
+                values[index : index + 2] == b"\x00\x00"
+                for index in range(0, len(values), 2)
+            ):
+                raise RequestValidationError("Frame JPEG has an invalid quantization value.")
+        tables.add(table_id)
+        offset += table_size
+    if not payload:
+        raise RequestValidationError("Frame JPEG has an empty quantization segment.")
+
+
+def _parse_jpeg_huffman_tables(
+    payload: bytes,
+    tables: dict[tuple[int, int], dict[tuple[int, int], int]],
+) -> None:
+    offset = 0
+    while offset < len(payload):
+        descriptor = payload[offset]
+        offset += 1
+        table_class = descriptor >> 4
+        table_id = descriptor & 0x0F
+        key = (table_class, table_id)
+        if table_class not in {0, 1} or table_id > 3 or key in tables:
+            raise RequestValidationError("Frame JPEG has invalid Huffman tables.")
+        if offset + 16 > len(payload):
+            raise RequestValidationError("Frame JPEG has a truncated Huffman table.")
+        counts = payload[offset : offset + 16]
+        offset += 16
+        symbol_count = sum(counts)
+        if symbol_count == 0 or symbol_count > 256 or offset + symbol_count > len(payload):
+            raise RequestValidationError("Frame JPEG has an invalid Huffman table.")
+        symbols = payload[offset : offset + symbol_count]
+        offset += symbol_count
+        decoder: dict[tuple[int, int], int] = {}
+        code = 0
+        symbol_offset = 0
+        for bit_length, count in enumerate(counts, start=1):
+            if code + count > 1 << bit_length:
+                raise RequestValidationError("Frame JPEG has an oversubscribed Huffman table.")
+            for _ in range(count):
+                decoder[(bit_length, code)] = symbols[symbol_offset]
+                symbol_offset += 1
+                code += 1
+            code <<= 1
+        tables[key] = decoder
+    if not payload:
+        raise RequestValidationError("Frame JPEG has an empty Huffman segment.")
+
+
+def _parse_jpeg_frame(
+    payload: bytes,
+) -> tuple[int, int, dict[int, tuple[int, int, int]]]:
+    if len(payload) < 6:
+        raise RequestValidationError("Frame JPEG has a truncated frame header.")
+    precision = payload[0]
+    height = int.from_bytes(payload[1:3], "big")
+    width = int.from_bytes(payload[3:5], "big")
+    component_count = payload[5]
+    if precision != 8 or component_count not in {1, 3}:
+        raise RequestValidationError("Frame JPEG uses an unsupported pixel format.")
+    if len(payload) != 6 + (3 * component_count):
+        raise RequestValidationError("Frame JPEG has an invalid frame header.")
+    if not 1 <= width <= MAX_ANALYSIS_EDGE or not 1 <= height <= MAX_ANALYSIS_EDGE:
+        raise RequestValidationError(
+            f"Frame JPEG dimensions must be from 1 to {MAX_ANALYSIS_EDGE}."
+        )
+    components: dict[int, tuple[int, int, int]] = {}
+    blocks_per_mcu = 0
+    for offset in range(6, len(payload), 3):
+        component_id = payload[offset]
+        sampling = payload[offset + 1]
+        horizontal = sampling >> 4
+        vertical = sampling & 0x0F
+        quantization_id = payload[offset + 2]
+        if (
+            component_id in components
+            or not 1 <= horizontal <= 4
+            or not 1 <= vertical <= 4
+            or quantization_id > 3
+        ):
+            raise RequestValidationError("Frame JPEG has invalid component metadata.")
+        blocks_per_mcu += horizontal * vertical
+        components[component_id] = (horizontal, vertical, quantization_id)
+    if blocks_per_mcu > 10:
+        raise RequestValidationError("Frame JPEG has excessive component sampling.")
+    return width, height, components
+
+
+def _parse_jpeg_scan(
+    payload: bytes,
+    components: dict[int, tuple[int, int, int]],
+) -> list[tuple[int, int, int, int, int]]:
+    if not payload:
+        raise RequestValidationError("Frame JPEG has a truncated scan header.")
+    component_count = payload[0]
+    if component_count != len(components) or len(payload) != 1 + 2 * component_count + 3:
+        raise RequestValidationError("Frame JPEG must contain one complete baseline scan.")
+    scan_components: list[tuple[int, int, int, int, int]] = []
+    seen: set[int] = set()
+    offset = 1
+    for _ in range(component_count):
+        component_id = payload[offset]
+        selectors = payload[offset + 1]
+        offset += 2
+        dc_table = selectors >> 4
+        ac_table = selectors & 0x0F
+        if (
+            component_id not in components
+            or component_id in seen
+            or dc_table > 3
+            or ac_table > 3
+        ):
+            raise RequestValidationError("Frame JPEG has invalid scan components.")
+        seen.add(component_id)
+        horizontal, vertical, quantization_id = components[component_id]
+        scan_components.append(
+            (component_id, horizontal, vertical, quantization_id, (dc_table << 4) | ac_table)
+        )
+    if set(components) != seen or payload[offset:] != b"\x00\x3f\x00":
+        raise RequestValidationError("Frame JPEG must use baseline sequential coding.")
+    return scan_components
+
+
+def _split_jpeg_entropy(data: bytes) -> tuple[list[bytes], list[int]]:
+    chunks: list[bytes] = []
+    restart_markers: list[int] = []
+    current = bytearray()
+    offset = 0
+    while offset < len(data):
+        value = data[offset]
+        if value != 0xFF:
+            current.append(value)
+            offset += 1
+            continue
+        marker_offset = offset + 1
+        while marker_offset < len(data) and data[marker_offset] == 0xFF:
+            marker_offset += 1
+        if marker_offset >= len(data):
+            raise RequestValidationError("Frame JPEG entropy data is truncated.")
+        marker = data[marker_offset]
+        if marker == 0x00:
+            if marker_offset != offset + 1:
+                raise RequestValidationError("Frame JPEG has invalid byte stuffing.")
+            current.append(0xFF)
+            offset = marker_offset + 1
+            continue
+        if not 0xD0 <= marker <= 0xD7:
+            raise RequestValidationError("Frame JPEG has an unexpected scan marker.")
+        chunks.append(bytes(current))
+        current.clear()
+        restart_markers.append(marker)
+        offset = marker_offset + 1
+    chunks.append(bytes(current))
+    return chunks, restart_markers
+
+
+def _decode_jpeg_huffman_symbol(
+    reader: _JpegBitReader, table: dict[tuple[int, int], int]
+) -> int:
+    code = 0
+    for bit_length in range(1, 17):
+        code = (code << 1) | reader.read_bit()
+        symbol = table.get((bit_length, code))
+        if symbol is not None:
+            return symbol
+    raise RequestValidationError("Frame JPEG contains an invalid Huffman code.")
+
+
+def _validate_jpeg_block(
+    reader: _JpegBitReader,
+    dc_table: dict[tuple[int, int], int],
+    ac_table: dict[tuple[int, int], int],
+) -> None:
+    dc_bits = _decode_jpeg_huffman_symbol(reader, dc_table)
+    if dc_bits > 11:
+        raise RequestValidationError("Frame JPEG has an invalid DC coefficient.")
+    reader.skip_bits(dc_bits)
+    coefficient = 1
+    while coefficient < 64:
+        symbol = _decode_jpeg_huffman_symbol(reader, ac_table)
+        run = symbol >> 4
+        size = symbol & 0x0F
+        if size == 0:
+            if run == 0:
+                return
+            if run != 15 or coefficient + 16 > 64:
+                raise RequestValidationError("Frame JPEG has an invalid AC coefficient run.")
+            coefficient += 16
+            continue
+        if size > 10 or coefficient + run >= 64:
+            raise RequestValidationError("Frame JPEG has an invalid AC coefficient.")
+        coefficient += run
+        reader.skip_bits(size)
+        coefficient += 1
+
+
+def _validate_jpeg_entropy(
+    entropy: bytes,
+    width: int,
+    height: int,
+    components: dict[int, tuple[int, int, int]],
+    scan_components: list[tuple[int, int, int, int, int]],
+    quantization_tables: set[int],
+    huffman_tables: dict[tuple[int, int], dict[tuple[int, int], int]],
+    restart_interval: int,
+) -> None:
+    max_horizontal = max(component[0] for component in components.values())
+    max_vertical = max(component[1] for component in components.values())
+    mcu_columns = (width + (8 * max_horizontal) - 1) // (8 * max_horizontal)
+    mcu_rows = (height + (8 * max_vertical) - 1) // (8 * max_vertical)
+    total_mcus = mcu_columns * mcu_rows
+    chunks, restart_markers = _split_jpeg_entropy(entropy)
+    expected_restarts = (
+        (total_mcus - 1) // restart_interval if restart_interval else 0
+    )
+    if len(restart_markers) != expected_restarts:
+        raise RequestValidationError("Frame JPEG has invalid restart markers.")
+    for index, marker in enumerate(restart_markers):
+        if marker != 0xD0 + (index % 8):
+            raise RequestValidationError("Frame JPEG restart markers are out of sequence.")
+
+    remaining_mcus = total_mcus
+    for chunk in chunks:
+        chunk_mcus = (
+            min(restart_interval, remaining_mcus)
+            if restart_interval
+            else remaining_mcus
+        )
+        if chunk_mcus <= 0:
+            raise RequestValidationError("Frame JPEG contains excess entropy data.")
+        reader = _JpegBitReader(chunk)
+        for _ in range(chunk_mcus):
+            for _, horizontal, vertical, quantization_id, selectors in scan_components:
+                if quantization_id not in quantization_tables:
+                    raise RequestValidationError(
+                        "Frame JPEG references a missing quantization table."
+                    )
+                dc_key = (0, selectors >> 4)
+                ac_key = (1, selectors & 0x0F)
+                if dc_key not in huffman_tables or ac_key not in huffman_tables:
+                    raise RequestValidationError("Frame JPEG references a missing Huffman table.")
+                for _ in range(horizontal * vertical):
+                    _validate_jpeg_block(
+                        reader, huffman_tables[dc_key], huffman_tables[ac_key]
+                    )
+        reader.require_fill_bits()
+        remaining_mcus -= chunk_mcus
+    if remaining_mcus != 0:
+        raise RequestValidationError("Frame JPEG entropy data is truncated.")
+
+
+def _find_jpeg_eoi(data: bytes, offset: int) -> tuple[int, int]:
+    while offset < len(data):
+        if data[offset] != 0xFF:
+            offset += 1
+            continue
+        marker_start = offset
+        marker_offset = offset + 1
+        while marker_offset < len(data) and data[marker_offset] == 0xFF:
+            marker_offset += 1
+        if marker_offset >= len(data):
+            break
+        marker = data[marker_offset]
+        if marker == 0x00 or 0xD0 <= marker <= 0xD7:
+            offset = marker_offset + 1
+            continue
+        if marker == 0xD9:
+            return marker_start, marker_offset + 1
+        raise RequestValidationError("Frame JPEG must contain one complete baseline scan.")
+    raise RequestValidationError("Frame JPEG is missing its end marker.")
+
+
+def _sanitize_jpeg(data: bytes) -> tuple[bytes, int, int]:
+    """Validate a baseline JPEG and remove metadata, comments, and trailing bytes."""
+    if not data.startswith(b"\xff\xd8"):
+        raise RequestValidationError("Frame bytes are not a JPEG image.")
+    output = bytearray(b"\xff\xd8")
+    offset = 2
+    width: int | None = None
+    height: int | None = None
+    components: dict[int, tuple[int, int, int]] | None = None
+    quantization_tables: set[int] = set()
+    huffman_tables: dict[tuple[int, int], dict[tuple[int, int], int]] = {}
+    restart_interval = 0
+    while offset < len(data):
+        if data[offset] != 0xFF:
+            raise RequestValidationError("Frame JPEG has invalid marker framing.")
+        marker_offset = offset + 1
+        while marker_offset < len(data) and data[marker_offset] == 0xFF:
+            marker_offset += 1
+        if marker_offset >= len(data):
+            raise RequestValidationError("Frame JPEG marker data is truncated.")
+        marker = data[marker_offset]
+        offset = marker_offset + 1
+        if marker in {0x00, 0x01, 0xD8} or 0xD0 <= marker <= 0xD9:
+            raise RequestValidationError("Frame JPEG has an unexpected marker.")
+        if offset + 2 > len(data):
+            raise RequestValidationError("Frame JPEG segment is truncated.")
+        segment_length = int.from_bytes(data[offset : offset + 2], "big")
+        if segment_length < 2 or offset + segment_length > len(data):
+            raise RequestValidationError("Frame JPEG has an invalid segment length.")
+        segment = data[offset : offset + segment_length]
+        payload = segment[2:]
+        offset += segment_length
+
+        if 0xE0 <= marker <= 0xEF or marker == 0xFE:
+            # APPn and COM are metadata-bearing and are intentionally not retained.
+            continue
+        if marker == 0xDB:
+            _parse_jpeg_quantization_tables(payload, quantization_tables)
+        elif marker == 0xC4:
+            _parse_jpeg_huffman_tables(payload, huffman_tables)
+        elif marker == 0xC0:
+            if components is not None:
+                raise RequestValidationError("Frame JPEG contains multiple frame headers.")
+            width, height, components = _parse_jpeg_frame(payload)
+        elif marker == 0xDD:
+            if len(payload) != 2:
+                raise RequestValidationError("Frame JPEG has an invalid restart interval.")
+            restart_interval = int.from_bytes(payload, "big")
+        elif marker == 0xDA:
+            if components is None or width is None or height is None:
+                raise RequestValidationError("Frame JPEG scan precedes its frame header.")
+            scan_components = _parse_jpeg_scan(payload, components)
+            entropy_end, image_end = _find_jpeg_eoi(data, offset)
+            entropy = data[offset:entropy_end]
+            _validate_jpeg_entropy(
+                entropy,
+                width,
+                height,
+                components,
+                scan_components,
+                quantization_tables,
+                huffman_tables,
+                restart_interval,
+            )
+            output.extend(b"\xff\xda")
+            output.extend(segment)
+            output.extend(entropy)
+            output.extend(b"\xff\xd9")
+            if image_end > len(data):
+                raise RequestValidationError("Frame JPEG is truncated.")
+            return bytes(output), width, height
+        else:
+            raise RequestValidationError("Frame JPEG uses an unsupported coding mode.")
+        output.extend(b"\xff")
+        output.append(marker)
+        output.extend(segment)
+    raise RequestValidationError("Frame JPEG has no image scan.")
+
+
+def _decode_data_url(value: Any) -> tuple[str, bytes, int, int, int]:
     if not isinstance(value, str):
         raise RequestValidationError("Each frame dataUrl must be a string.")
     match = DATA_URL_RE.fullmatch(value)
     if not match:
         raise RequestValidationError(
-            "Frames must be base64 JPEG, PNG, WebP, or GIF image data URLs."
+            "Frames must be browser-prepared base64 JPEG image data URLs."
         )
     mime_type = match.group(1).lower()
     if mime_type not in ALLOWED_IMAGE_MIMES:
@@ -228,9 +704,8 @@ def _decode_data_url(value: Any) -> tuple[str, int]:
         raise RequestValidationError("Frames cannot be empty.")
     if size > MAX_FRAME_BYTES:
         raise RequestValidationError("Each decoded frame must be 4 MB or smaller.")
-    if not _has_expected_image_signature(decoded, mime_type):
-        raise RequestValidationError("Frame bytes do not match the declared image type.")
-    return mime_type, size
+    sanitized, width, height = _sanitize_jpeg(decoded)
+    return mime_type, sanitized, width, height, size
 
 
 def _frame_timestamp_ms(frame: dict[str, Any], media_type: str) -> int | None:
@@ -312,8 +787,10 @@ def validate_analysis_payload(payload: Any) -> ValidatedAnalysis:
         if ("width" in frame) != ("height" in frame):
             raise RequestValidationError("Frame width and height must be provided together.")
 
-        mime_type, decoded_size = _decode_data_url(frame["dataUrl"])
-        total_size += decoded_size
+        mime_type, decoded, decoded_width, decoded_height, submitted_size = (
+            _decode_data_url(frame["dataUrl"])
+        )
+        total_size += submitted_size
         if total_size > MAX_TOTAL_FRAME_BYTES:
             raise RequestValidationError("Decoded frame data must total 12 MB or less.")
         timestamp_ms = _frame_timestamp_ms(frame, media_type)
@@ -323,15 +800,24 @@ def validate_analysis_payload(payload: Any) -> ValidatedAnalysis:
                 raise RequestValidationError("Video frame timestamps must increase.")
             previous_timestamp = timestamp_ms
 
-        width = _validate_dimension(frame["width"], "width") if "width" in frame else None
-        height = _validate_dimension(frame["height"], "height") if "height" in frame else None
+        if "width" in frame:
+            submitted_width = _validate_dimension(frame["width"], "width")
+            submitted_height = _validate_dimension(frame["height"], "height")
+            if (submitted_width, submitted_height) != (decoded_width, decoded_height):
+                raise RequestValidationError(
+                    "Frame dimensions do not match the server-validated JPEG."
+                )
         validated.append(
             ValidatedFrame(
-                data_url=frame["dataUrl"],
+                data_url=(
+                    "data:image/jpeg;base64,"
+                    + base64.b64encode(decoded).decode("ascii")
+                ),
+                data=decoded,
                 mime_type=mime_type,
                 timestamp_ms=timestamp_ms,
-                width=width,
-                height=height,
+                width=decoded_width,
+                height=decoded_height,
             )
         )
 
@@ -749,13 +1235,212 @@ def analyze_scene(request_data: ValidatedAnalysis, api_key: str) -> dict[str, An
     return _normalize_model_output(structured, request_data, model)
 
 
+MEDIA_OBJECT_KEY_RE = re.compile(r"\A[a-f0-9]{64}\Z")
+MEDIA_PREFIX_RE = re.compile(r"\A[a-f0-9]{2}\Z")
+MEDIA_STAGING_FILE_RE = re.compile(r"\A[a-f0-9]{64}\.tmp\Z")
+WINDOWS_REPARSE_POINT = 0x0400
+
+
+def _media_object_path(media_root: Path, object_key: str) -> Path:
+    """Resolve an opaque object key below media_root without accepting path syntax."""
+    if not isinstance(object_key, str) or not MEDIA_OBJECT_KEY_RE.fullmatch(object_key):
+        raise EvidenceStorageError("Invalid media object key.")
+    root = media_root.resolve()
+    candidate = (root / object_key[:2] / object_key).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise EvidenceStorageError("Media object path escaped its configured root.") from exc
+    return candidate
+
+
+def _best_effort_unlink(paths: list[Path]) -> None:
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            # Cleanup is best-effort; opaque orphan files reveal no patient identity.
+            pass
+
+
+def _plain_path_kind(path: Path) -> str | None:
+    """Classify a direct child without following symlinks or Windows reparse points."""
+    try:
+        details = path.lstat()
+    except OSError:
+        return None
+    if stat.S_ISLNK(details.st_mode) or (
+        getattr(details, "st_file_attributes", 0) & WINDOWS_REPARSE_POINT
+    ):
+        return "reparse"
+    if stat.S_ISREG(details.st_mode):
+        return "file"
+    if stat.S_ISDIR(details.st_mode):
+        return "directory"
+    return "other"
+
+
+def _require_no_reparse_ancestors(path: Path) -> None:
+    candidate = Path(os.path.abspath(path))
+    while True:
+        if _plain_path_kind(candidate) == "reparse":
+            raise EvidenceStorageError(
+                "The configured media path cannot contain a reparse point."
+            )
+        parent = candidate.parent
+        if parent == candidate:
+            return
+        candidate = parent
+
+
+def _reconcile_media_store(media_root: Path, referenced_keys: set[str]) -> None:
+    """Remove only recognizable uncommitted objects left by an interrupted save."""
+    _require_no_reparse_ancestors(media_root)
+    root = media_root.resolve()
+    if not root.exists():
+        return
+    if _plain_path_kind(root) != "directory":
+        raise EvidenceStorageError("The configured media root is not a plain directory.")
+    if any(not MEDIA_OBJECT_KEY_RE.fullmatch(key) for key in referenced_keys):
+        raise EvidenceStorageError("Stored evidence metadata contains an invalid object key.")
+
+    removed_objects = 0
+    removed_staged = 0
+
+    def remove(candidate: Path, category: str) -> None:
+        nonlocal removed_objects, removed_staged
+        try:
+            candidate.unlink()
+        except OSError as exc:
+            sys.stderr.write(
+                f"[careview] evidence reconciliation failed for {category} "
+                f"{candidate.name}\n"
+            )
+            raise EvidenceStorageError("Evidence reconciliation could not finish.") from exc
+        sys.stderr.write(
+            f"[careview] evidence reconciliation removed {category} {candidate.name}\n"
+        )
+        if category == "orphan object":
+            removed_objects += 1
+        else:
+            removed_staged += 1
+
+    staging = root / ".staging"
+    staging_kind = _plain_path_kind(staging)
+    if staging_kind == "directory":
+        try:
+            staged_children = list(staging.iterdir())
+        except OSError as exc:
+            raise EvidenceStorageError("Evidence staging could not be inspected.") from exc
+        for candidate in staged_children:
+            if (
+                MEDIA_STAGING_FILE_RE.fullmatch(candidate.name)
+                and _plain_path_kind(candidate) == "file"
+            ):
+                remove(candidate, "stale staging file")
+    elif staging_kind not in {None}:
+        # Unexpected and reparse-point entries are deliberately never traversed or removed.
+        sys.stderr.write("[careview] evidence reconciliation skipped unsafe .staging entry\n")
+
+    try:
+        root_children = list(root.iterdir())
+    except OSError as exc:
+        raise EvidenceStorageError("Evidence storage could not be inspected.") from exc
+    for prefix in root_children:
+        if (
+            not MEDIA_PREFIX_RE.fullmatch(prefix.name)
+            or _plain_path_kind(prefix) != "directory"
+        ):
+            continue
+        try:
+            candidates = list(prefix.iterdir())
+        except OSError as exc:
+            raise EvidenceStorageError("Evidence objects could not be inspected.") from exc
+        for candidate in candidates:
+            object_key = candidate.name
+            if (
+                not MEDIA_OBJECT_KEY_RE.fullmatch(object_key)
+                or not object_key.startswith(prefix.name)
+                or _plain_path_kind(candidate) != "file"
+            ):
+                continue
+            if object_key not in referenced_keys:
+                remove(candidate, "orphan object")
+
+    if removed_objects or removed_staged:
+        sys.stderr.write(
+            "[careview] evidence reconciliation completed: "
+            f"{removed_objects} orphan object(s), {removed_staged} staging file(s) removed\n"
+        )
+
+
+def _persist_evidence_frames(
+    media_root: Path, frames: tuple[ValidatedFrame, ...]
+) -> tuple[list[dict[str, Any]], list[Path]]:
+    """Atomically place sanitized JPEG frame bytes and return DB-only metadata."""
+    root = media_root.resolve()
+    staged_paths: list[Path] = []
+    final_paths: list[Path] = []
+    records: list[dict[str, Any]] = []
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        staging = (root / ".staging").resolve()
+        try:
+            staging.relative_to(root)
+        except ValueError as exc:
+            raise EvidenceStorageError("Media staging path escaped its configured root.") from exc
+        staging.mkdir(parents=True, exist_ok=True)
+
+        for frame_number, frame in enumerate(frames, start=1):
+            media_id = secrets.token_hex(16)
+            object_key = secrets.token_hex(32)
+            final_path = _media_object_path(root, object_key)
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            staged_path = staging / f"{secrets.token_hex(32)}.tmp"
+            staged_paths.append(staged_path)
+            with staged_path.open("xb") as output:
+                output.write(frame.data)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(staged_path, final_path)
+            staged_paths.remove(staged_path)
+            final_paths.append(final_path)
+            try:
+                os.chmod(final_path, 0o600)
+            except OSError:
+                # Windows ACLs are managed outside Python; the private root remains required.
+                pass
+            records.append(
+                {
+                    "id": media_id,
+                    "objectKey": object_key,
+                    "mimeType": frame.mime_type,
+                    "byteSize": len(frame.data),
+                    "sha256": hashlib.sha256(frame.data).hexdigest(),
+                    "width": frame.width,
+                    "height": frame.height,
+                    "frameNumber": frame_number,
+                    "timestampMs": frame.timestamp_ms,
+                }
+            )
+    except (OSError, EvidenceStorageError) as exc:
+        _best_effort_unlink([*staged_paths, *final_paths])
+        if isinstance(exc, EvidenceStorageError):
+            raise
+        raise EvidenceStorageError("Evidence files could not be persisted.") from exc
+    return records, final_paths
+
+
 class CareviewHandler(BaseHTTPRequestHandler):
     server_version = "Careview/1.0"
     sys_version = ""
     static_root = Path(__file__).resolve().parent
     store: CareviewStore
+    media_root = Path(__file__).resolve().parent / "data" / "media"
+    retain_evidence = False
     secure_cookie = False
     login_limiter = LoginRateLimiter()
+    setup_token: str | None = None
 
     def _send_headers(
         self,
@@ -948,7 +1633,11 @@ class CareviewHandler(BaseHTTPRequestHandler):
         if path == "/api/health":
             self._send_json(
                 HTTPStatus.OK,
-                {"status": "ok", "aiConfigured": bool(os.environ.get("OPENAI_API_KEY", "").strip())},
+                {
+                    "status": "ok",
+                    "aiConfigured": bool(os.environ.get("OPENAI_API_KEY", "").strip()),
+                    "evidenceRetentionEnabled": self.retain_evidence,
+                },
             )
             return
         if path == "/api/session":
@@ -956,6 +1645,7 @@ class CareviewHandler(BaseHTTPRequestHandler):
             response: dict[str, Any] = {
                 "authenticated": context is not None,
                 "setupRequired": self.store.setup_required(),
+                "evidenceRetentionEnabled": self.retain_evidence,
             }
             if context is not None:
                 response["user"] = context["user"]
@@ -985,6 +1675,49 @@ class CareviewHandler(BaseHTTPRequestHandler):
             except (AuthenticationError, StoreValidationError) as exc:
                 self._handle_store_error(exc)
             return
+        media_match = re.fullmatch(
+            r"/api/patients/([^/]+)/scenes/([^/]+)/media/([^/]+)", path
+        )
+        if media_match:
+            context = self._require_session()
+            if context is None:
+                return
+            try:
+                record = self.store.get_scene_media(
+                    context,
+                    media_match.group(1),
+                    media_match.group(2),
+                    media_match.group(3),
+                )
+                target = _media_object_path(self.media_root, record["objectKey"])
+                data = target.read_bytes()
+                if (
+                    len(data) != record["byteSize"]
+                    or hashlib.sha256(data).hexdigest() != record["sha256"]
+                    or record["mimeType"] not in ALLOWED_IMAGE_MIMES
+                ):
+                    raise EvidenceStorageError("Evidence integrity verification failed.")
+                self._send_headers(
+                    HTTPStatus.OK,
+                    record["mimeType"],
+                    len(data),
+                    no_store=True,
+                    extra_headers={
+                        "Content-Disposition": f'inline; filename="{record["id"]}"',
+                        "Cross-Origin-Resource-Policy": "same-origin",
+                    },
+                )
+                if self.command != "HEAD":
+                    self.wfile.write(data)
+            except (AuthenticationError, NotFoundError, StoreValidationError) as exc:
+                self._handle_store_error(exc)
+            except (EvidenceStorageError, OSError):
+                self._send_error_json(
+                    HTTPStatus.NOT_FOUND,
+                    "not_found",
+                    "Resource not found.",
+                )
+            return
         scene_match = re.fullmatch(r"/api/patients/([^/]+)/scenes", path)
         if scene_match:
             context = self._require_session()
@@ -1008,7 +1741,11 @@ class CareviewHandler(BaseHTTPRequestHandler):
         if path == "/api/health":
             self._send_json(
                 HTTPStatus.OK,
-                {"status": "ok", "aiConfigured": bool(os.environ.get("OPENAI_API_KEY", "").strip())},
+                {
+                    "status": "ok",
+                    "aiConfigured": bool(os.environ.get("OPENAI_API_KEY", "").strip()),
+                    "evidenceRetentionEnabled": self.retain_evidence,
+                },
             )
             return
         self._serve_static(path)
@@ -1098,22 +1835,25 @@ class CareviewHandler(BaseHTTPRequestHandler):
             self._handle_store_error(exc)
 
     def _post_setup(self) -> None:
-        try:
-            is_loopback = ipaddress.ip_address(self.client_address[0]).is_loopback
-        except ValueError:
-            is_loopback = False
-        if not is_loopback:
-            self._send_error_json(
-                HTTPStatus.FORBIDDEN,
-                "setup_local_only",
-                "Initial setup must be completed on the server computer.",
-            )
-            return
         if not self.store.setup_required():
             self._send_error_json(
                 HTTPStatus.CONFLICT,
                 "setup_complete",
                 "Initial setup has already been completed.",
+            )
+            return
+        supplied_token = self.headers.get(SETUP_TOKEN_HEADER, "")
+        expected_token = self.setup_token or ""
+        if (
+            not supplied_token
+            or len(supplied_token) > 128
+            or not expected_token
+            or not hmac.compare_digest(supplied_token, expected_token)
+        ):
+            self._send_error_json(
+                HTTPStatus.FORBIDDEN,
+                "setup_token_invalid",
+                "Enter the one-time setup token shown in the Careview server console.",
             )
             return
         payload = self._read_api_json(MAX_AUTH_REQUEST_BYTES)
@@ -1127,6 +1867,7 @@ class CareviewHandler(BaseHTTPRequestHandler):
             user, session_token, csrf_token = self.store.setup(
                 payload["workspaceName"], payload["displayName"], payload["email"], payload["password"]
             )
+            type(self).setup_token = None
             self._send_json(
                 HTTPStatus.CREATED,
                 {"user": user, "csrfToken": csrf_token},
@@ -1268,6 +2009,20 @@ class CareviewHandler(BaseHTTPRequestHandler):
                 "The analysis could not be completed.",
             )
             return
+        media_records: list[dict[str, Any]] = []
+        media_paths: list[Path] = []
+        if self.retain_evidence:
+            try:
+                media_records, media_paths = _persist_evidence_frames(
+                    self.media_root, validated.frames
+                )
+            except EvidenceStorageError:
+                self._send_error_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    "evidence_storage_failed",
+                    "The analysis completed, but its evidence could not be saved.",
+                )
+                return
         try:
             scene = self.store.create_scene(
                 context,
@@ -1279,9 +2034,19 @@ class CareviewHandler(BaseHTTPRequestHandler):
                     "framesSubmitted": len(validated.frames),
                 },
                 result,
+                media_records,
             )
         except (AuthenticationError, NotFoundError, StoreValidationError) as exc:
+            _best_effort_unlink(media_paths)
             self._handle_store_error(exc)
+            return
+        except Exception:
+            _best_effort_unlink(media_paths)
+            self._send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "evidence_storage_failed" if self.retain_evidence else "internal_error",
+                "The analysis could not be saved.",
+            )
             return
         response = dict(result)
         response["scene"] = scene
@@ -1300,19 +2065,53 @@ def create_server(
     db_path: Path | None = None,
     *,
     secure_cookie: bool = False,
-) -> ThreadingHTTPServer:
+    media_root: Path | None = None,
+    retain_evidence: bool = False,
+    setup_token: str | None = None,
+) -> CareviewHTTPServer:
     root = (static_root or Path(__file__).resolve().parent).resolve()
     database = (db_path or (Path(__file__).resolve().parent / "data" / "careview.db")).resolve()
-    store = CareviewStore(database)
+    configured_media = Path(media_root or (database.parent / "media"))
+    if retain_evidence:
+        _require_no_reparse_ancestors(configured_media)
+    private_media = configured_media.resolve()
+    instance_lock = CareviewInstanceLock(database.parent)
+    try:
+        store = CareviewStore(database)
+        if retain_evidence:
+            _reconcile_media_store(private_media, store.list_media_object_keys())
+    except Exception:
+        instance_lock.close()
+        raise
+    bootstrap_token = None
+    if store.setup_required():
+        bootstrap_token = setup_token or secrets.token_urlsafe(24)
+        if len(bootstrap_token) < 16 or len(bootstrap_token) > 128:
+            instance_lock.close()
+            raise ValueError("The initial setup token must contain 16 to 128 characters.")
 
     class ConfiguredCareviewHandler(CareviewHandler):
         pass
 
     ConfiguredCareviewHandler.static_root = root
     ConfiguredCareviewHandler.store = store
+    ConfiguredCareviewHandler.media_root = private_media
+    ConfiguredCareviewHandler.retain_evidence = retain_evidence
     ConfiguredCareviewHandler.secure_cookie = secure_cookie
     ConfiguredCareviewHandler.login_limiter = LoginRateLimiter()
-    return ThreadingHTTPServer((host, port), ConfiguredCareviewHandler)
+    ConfiguredCareviewHandler.setup_token = bootstrap_token
+    return CareviewHTTPServer(
+        (host, port), ConfiguredCareviewHandler, instance_lock=instance_lock
+    )
+
+
+def _is_loopback_bind(host: str) -> bool:
+    if host.casefold() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def main() -> None:
@@ -1342,16 +2141,50 @@ def main() -> None:
         action="store_true",
         help="Mark session cookies Secure (required when serving over HTTPS).",
     )
+    parser.add_argument(
+        "--media-directory",
+        type=Path,
+        default=Path(__file__).resolve().parent / "data" / "media",
+        help="Private evidence media directory (default: careview/data/media).",
+    )
+    parser.add_argument(
+        "--retain-evidence",
+        action="store_true",
+        help="Retain validated image and sampled-frame evidence after saved analyses.",
+    )
+    parser.add_argument(
+        "--allow-insecure-lan-testing",
+        action="store_true",
+        help="Allow a non-loopback plain-HTTP bind for synthetic testing only.",
+    )
     args = parser.parse_args()
+    loopback_bind = _is_loopback_bind(args.host)
+    if not loopback_bind and not args.allow_insecure_lan_testing:
+        parser.error(
+            "a non-loopback bind requires --allow-insecure-lan-testing and synthetic data"
+        )
+    if not loopback_bind and (args.retain_evidence or args.secure_cookie):
+        parser.error(
+            "direct LAN HTTP cannot use retained evidence or Secure cookies; use an HTTPS reverse proxy to loopback Careview"
+        )
+    default_database = (Path(__file__).resolve().parent / "data" / "careview.db").resolve()
+    if not loopback_bind and args.database.resolve() != default_database:
+        parser.error("direct LAN HTTP cannot use a durable custom database")
     server = create_server(
         args.host,
         args.port,
         args.directory,
         args.database,
         secure_cookie=args.secure_cookie,
+        media_root=args.media_directory,
+        retain_evidence=args.retain_evidence,
     )
-    print(f"Careview is available at http://{args.host}:{server.server_port}")
-    print("Press Ctrl+C to stop. OPENAI_API_KEY remains server-side.")
+    print(f"Careview is available at http://{args.host}:{server.server_port}", flush=True)
+    setup_token = server.RequestHandlerClass.setup_token
+    if setup_token:
+        print(f"One-time initial setup token: {setup_token}", flush=True)
+        print("This token expires after setup or when the server restarts.", flush=True)
+    print("Press Ctrl+C to stop. OPENAI_API_KEY remains server-side.", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

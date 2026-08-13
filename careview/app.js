@@ -62,6 +62,7 @@
     user: null,
     csrfToken: "",
     expiresAt: null,
+    evidenceRetentionEnabled: false,
   };
   let currentRoute = "patients";
   let selectedPatient = null;
@@ -191,7 +192,7 @@
     clearSessionExpiryTimer();
     clearSensitiveClientState();
     authDraft = { workspaceName: "", displayName: "", email: "" };
-    session = { status: "ready", authenticated: false, setupRequired, user: null, csrfToken: "", expiresAt: null };
+    session = { status: "ready", authenticated: false, setupRequired, user: null, csrfToken: "", expiresAt: null, evidenceRetentionEnabled: false };
     currentRoute = "patients";
     window.history.replaceState({ route: "patients", scanStep: 0 }, "");
     render();
@@ -291,6 +292,123 @@
     return payload || {};
   }
 
+  function normalizeAuthorizedMediaUrl(value) {
+    if (typeof value !== "string" || !value.trim() || value.length > 2048) return "";
+    try {
+      const url = new URL(value, window.location.origin);
+      if (url.origin !== window.location.origin || !url.pathname.startsWith("/api/")) return "";
+      if (!/^\/api\/patients\/[^/]+\/scenes\/[^/]+\/media\/[^/]+$/.test(url.pathname)) return "";
+      return `${url.pathname}${url.search}`;
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  function normalizeStoredMedia(rawMedia, index) {
+    if (!rawMedia || typeof rawMedia !== "object" || Array.isArray(rawMedia)) return null;
+    const mimeCandidate = String(rawMedia.mimeType ?? rawMedia.mime_type ?? "application/octet-stream").toLowerCase();
+    const mimeType = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/i.test(mimeCandidate)
+      ? mimeCandidate
+      : "application/octet-stream";
+    const rawByteSize = rawMedia.byteSize ?? rawMedia.byte_size;
+    const byteSizeValue = rawByteSize == null ? Number.NaN : Number(rawByteSize);
+    const widthValue = Number(rawMedia.width);
+    const heightValue = Number(rawMedia.height);
+    const rawTimestampSeconds = rawMedia.timestampSeconds ?? rawMedia.timestamp_seconds;
+    const rawTimestampMilliseconds = rawMedia.timestampMs ?? rawMedia.timestamp_ms;
+    const timestampValue = rawTimestampSeconds != null
+      ? Number(rawTimestampSeconds)
+      : rawTimestampMilliseconds != null ? Number(rawTimestampMilliseconds) / 1000 : Number.NaN;
+    const frameValue = Number(rawMedia.frameNumber ?? rawMedia.frame_number);
+    return {
+      id: String(rawMedia.id || `stored-media-${index + 1}`),
+      url: normalizeAuthorizedMediaUrl(rawMedia.url),
+      mimeType,
+      byteSize: Number.isSafeInteger(byteSizeValue) && byteSizeValue >= 0 ? byteSizeValue : null,
+      width: Number.isInteger(widthValue) && widthValue > 0 ? widthValue : null,
+      height: Number.isInteger(heightValue) && heightValue > 0 ? heightValue : null,
+      timestampSeconds: Number.isFinite(timestampValue) && timestampValue >= 0 ? timestampValue : null,
+      frameNumber: Number.isInteger(frameValue) && frameValue > 0 ? frameValue : null,
+    };
+  }
+
+  function formatStoredMediaSize(byteSize) {
+    if (!Number.isSafeInteger(byteSize) || byteSize < 0) return "Size unavailable";
+    if (byteSize < 1024) return `${byteSize} B`;
+    if (byteSize < 1024 * 1024) return `${Math.max(1, Math.round(byteSize / 1024))} KB`;
+    return `${(byteSize / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  function storedMediaDetail(media) {
+    const parts = [];
+    if (media.frameNumber) parts.push(`Frame ${media.frameNumber}`);
+    if (media.timestampSeconds != null) parts.push(formatEvidenceTimestamp(media.timestampSeconds));
+    if (media.width && media.height) parts.push(`${media.width} \u00d7 ${media.height}`);
+    parts.push(formatStoredMediaSize(media.byteSize));
+    return parts.join(" \u00b7 ");
+  }
+
+  function renderStoredMediaItem(media, { compact = false, linked = true } = {}) {
+    const safeUrl = escapeHtml(media.url);
+    const detail = escapeHtml(storedMediaDetail(media));
+    const isImage = media.mimeType.startsWith("image/");
+    const label = media.frameNumber ? `Protected evidence frame ${media.frameNumber}` : "Protected scene evidence image";
+    if (!media.url) {
+      return `<div class="stored-media-item ${compact ? "compact" : ""} unavailable" role="status">
+        <span class="stored-media-fallback">${icon("lock")}<span><strong>Image unavailable</strong><small>The protected record may have expired or been removed.</small></span></span>
+        <span class="stored-media-detail">${detail}</span>
+      </div>`;
+    }
+    if (!isImage) {
+      return `<div class="stored-media-item ${compact ? "compact" : ""}">
+        <a class="stored-media-file" href="${safeUrl}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer" aria-label="Open protected scene media in a new tab">${icon("lock")}<span><strong>Open protected media</strong><small>${detail}</small></span></a>
+        <span class="stored-media-private">Authorized staff only</span>
+      </div>`;
+    }
+    const image = `<img class="stored-media-image" src="${safeUrl}" alt="${escapeHtml(label)}" loading="lazy" decoding="async" referrerpolicy="no-referrer" data-stored-media-image />
+      <span class="stored-media-fallback" hidden>${icon("lock")}<span><strong>Preview unavailable</strong><small>Open the protected record to retry.</small></span></span>`;
+    return `<figure class="stored-media-item ${compact ? "compact" : ""}">
+      ${linked ? `<a class="stored-media-preview" href="${safeUrl}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer" aria-label="${escapeHtml(label)}; open protected image in a new tab">${image}</a>` : `<div class="stored-media-preview">${image}</div>`}
+      <span class="stored-media-private">Private patient record</span>
+      <figcaption><span>${detail}</span>${linked ? "<strong>Open protected image</strong>" : "<strong>Open details to view</strong>"}</figcaption>
+    </figure>`;
+  }
+
+  function renderStoredMediaGallery(mediaItems, { compact = false, linked = true, empty = true, label = "Stored scene evidence" } = {}) {
+    const items = Array.isArray(mediaItems) ? mediaItems : [];
+    if (!items.length) {
+      return empty
+        ? `<div class="stored-media-empty" role="status">${icon("image")}<span><strong>No stored image available</strong><small>Older records or removed media can still retain their written review.</small></span></div>`
+        : "";
+    }
+    return `<section class="stored-media-section ${compact ? "compact" : ""}" aria-label="${escapeHtml(label)}">
+      ${compact ? "" : `<div class="stored-media-heading"><strong>${escapeHtml(label)}</strong><span>${icon("lock")} Authorized staff only \u00b7 not available offline</span></div>`}
+      <div class="stored-media-grid">${items.map((item) => renderStoredMediaItem(item, { compact, linked })).join("")}</div>
+    </section>`;
+  }
+
+  function storedMediaForFinding(finding) {
+    const mediaItems = Array.isArray(finding?.media) ? finding.media : [];
+    const frameNumbers = Array.isArray(finding?.evidenceFrameNumbers) ? finding.evidenceFrameNumbers : [];
+    const timestamps = Array.isArray(finding?.evidenceTimestamps) ? finding.evidenceTimestamps : [];
+    if (!frameNumbers.length && !timestamps.length) return mediaItems;
+    const matched = mediaItems.filter((media) => (
+      (media.frameNumber != null && frameNumbers.includes(media.frameNumber))
+      || (media.timestampSeconds != null && timestamps.some((timestamp) => Math.abs(timestamp - media.timestampSeconds) <= 0.05))
+    ));
+    // Never imply that an unrelated retained frame supports a finding. If the
+    // server's cited frame metadata cannot be matched, show the unavailable
+    // evidence state and require an in-person check.
+    return matched;
+  }
+
+  function handleStoredMediaError(event) {
+    const image = event.target.closest?.("[data-stored-media-image]");
+    if (!image) return;
+    image.hidden = true;
+    image.closest(".stored-media-preview")?.querySelector(".stored-media-fallback")?.removeAttribute("hidden");
+  }
+
   function normalizeFinding(rawFinding, scene) {
     const urgencyValue = String(rawFinding?.urgency || "soon").toLowerCase().replaceAll(" ", "_");
     const urgency = ["now", "soon", "monitor"].includes(urgencyValue) ? urgencyValue : urgencyValue === "check_now" ? "now" : "soon";
@@ -327,6 +445,7 @@
       frameTimestamps: [...scene.frameTimestamps],
       evidenceFrameNumbers: Array.isArray(frames) ? frames.filter(Number.isInteger).slice(0, MAX_VIDEO_FRAMES) : [],
       evidenceTimestamps: Array.isArray(evidenceTimestamps) ? evidenceTimestamps.filter(Number.isFinite).slice(0, MAX_VIDEO_FRAMES) : [],
+      media: scene.media,
       source: scene.source,
       assessmentStatus: scene.assessmentStatus,
       assessmentOutcome: scene.assessmentOutcome,
@@ -348,6 +467,7 @@
     const frameTimestamps = Array.isArray(rawFrameSeconds)
       ? rawFrameSeconds
       : Array.isArray(rawFrameMilliseconds) ? rawFrameMilliseconds.filter(Number.isFinite).map((value) => value / 1000) : [];
+    const rawMedia = Array.isArray(rawScene?.media) ? rawScene.media : [];
     const scene = {
       id: String(rawScene?.id || ""),
       zone: zoneKey,
@@ -362,6 +482,7 @@
         ? rawAssessment.framesSent ?? rawAssessment.frames_sent ?? rawAssessment.framesSubmitted ?? rawAssessment.frames_submitted ?? rawScene.framesSubmitted ?? rawScene.frames_submitted
         : Array.isArray(frameTimestamps) ? frameTimestamps.length : 0,
       frameTimestamps: Array.isArray(frameTimestamps) ? frameTimestamps.filter(Number.isFinite).slice(0, MAX_VIDEO_FRAMES) : [],
+      media: rawMedia.slice(0, MAX_VIDEO_FRAMES).map(normalizeStoredMedia).filter(Boolean),
       assessmentStatus: rawAssessment?.assessmentStatus ?? rawAssessment?.assessment_status ?? rawAssessment?.status ?? "assessed",
       assessmentOutcome: rawAssessment?.assessmentOutcome ?? rawAssessment?.assessment_outcome ?? null,
       assessmentNote: rawAssessment?.assessmentNote ?? rawAssessment?.assessment_note ?? null,
@@ -407,6 +528,7 @@
             durationSeconds: refreshedScene.durationSeconds,
             framesSent: refreshedScene.framesSent,
             frameTimestamps: [...refreshedScene.frameTimestamps],
+            media: [...refreshedScene.media],
             unableToAssess: refreshedScene.unableToAssess,
             assessmentNote: refreshedScene.assessmentNote,
             assessmentStatus: refreshedScene.assessmentStatus,
@@ -497,6 +619,7 @@
         user: payload.user || null,
         csrfToken: typeof payload.csrfToken === "string" ? payload.csrfToken : "",
         expiresAt: Number.isFinite(Number(payload.expiresAt)) ? Number(payload.expiresAt) : null,
+        evidenceRetentionEnabled: payload.evidenceRetentionEnabled === true,
       };
       if (session.authenticated) {
         scheduleSessionExpiry(session.expiresAt);
@@ -509,7 +632,7 @@
     } catch (error) {
       clearSessionExpiryTimer();
       clearSensitiveClientState();
-      session = { status: "error", authenticated: false, setupRequired: false, user: null, csrfToken: "", expiresAt: null };
+      session = { status: "error", authenticated: false, setupRequired: false, user: null, csrfToken: "", expiresAt: null, evidenceRetentionEnabled: false };
       authError = error.message;
     }
     render();
@@ -538,6 +661,7 @@
           user: nextUser,
           csrfToken: typeof payload.csrfToken === "string" ? payload.csrfToken : session.csrfToken,
           expiresAt: Number.isFinite(Number(payload.expiresAt)) ? Number(payload.expiresAt) : null,
+          evidenceRetentionEnabled: payload.evidenceRetentionEnabled === true,
         };
         scheduleSessionExpiry(session.expiresAt);
 
@@ -571,7 +695,9 @@
              <h1 id="auth-title">${setup ? "Create the first administrator" : "Sign in to Careview"}</h1>
              <p class="lead">${setup ? "Set up this private workspace. The first account can add healthcare staff and patients." : "Use your assigned healthcare account to access authorized patients."}</p>
              <form class="auth-form" data-form="${setup ? "setup" : "login"}">
-               ${setup ? `<label class="field-label" for="workspace-name">Workspace name</label><input class="text-input" id="workspace-name" name="workspaceName" autocomplete="organization" minlength="2" maxlength="80" value="${escapeHtml(authDraft.workspaceName)}" required />
+               ${setup ? `<label class="field-label" for="setup-token">One-time setup token</label><input class="text-input" id="setup-token" name="setupToken" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="256" aria-describedby="setup-token-help" required />
+                 <p class="field-help" id="setup-token-help">Enter the token printed only in the server console. It expires after setup or a server restart.</p>
+                 <label class="field-label" for="workspace-name">Workspace name</label><input class="text-input" id="workspace-name" name="workspaceName" autocomplete="organization" minlength="2" maxlength="80" value="${escapeHtml(authDraft.workspaceName)}" required />
                  <label class="field-label" for="setup-name">Your display name</label><input class="text-input" id="setup-name" name="displayName" autocomplete="name" minlength="2" maxlength="100" value="${escapeHtml(authDraft.displayName)}" required />` : ""}
                <label class="field-label" for="auth-email">Email</label><input class="text-input" id="auth-email" name="email" type="email" inputmode="email" autocomplete="username" maxlength="254" value="${escapeHtml(authDraft.email)}" required />
                <label class="field-label" for="auth-password">Password</label><input class="text-input" id="auth-password" name="password" type="password" autocomplete="${setup ? "new-password" : "current-password"}" minlength="${setup ? 14 : 1}" maxlength="200" required />
@@ -845,7 +971,7 @@
         </div>
         <p class="media-help" id="media-help">On iPhone, Take photo and Record video request the rear camera. Capture is a browser hint, so check the selected media before continuing. Images: up to 12 MB. Videos: 1–30 seconds, up to 100 MB, 480p–4K.</p>
         <p class="media-error" id="media-error" role="alert" ${mediaError ? "" : "hidden"}>${escapeHtml(mediaError)}</p>
-        <div class="privacy-note" style="margin-top:12px">${icon("lock")}<span>${isDemoMedia ? "The illustrated demo stays on this device and is never uploaded." : "The selected file stays temporarily on this device during the current check. Images are resized to JPEG; videos are converted to at most six silent still frames. Raw video and audio are never sent."}</span></div>
+        <div class="privacy-note" style="margin-top:12px">${icon("lock")}<span>${isDemoMedia ? "The illustrated demo stays on this device and is never uploaded." : `The selected source file stays temporarily on this device during the current check. ${mediaType === "video" ? "The original video and audio are not uploaded; at most six resized, silent frames are prepared." : "The selected image is resized into one prepared JPEG."} ${session.evidenceRetentionEnabled ? "Prepared JPEG evidence will be stored with the protected patient record on this on-prem server." : "Prepared JPEG evidence is not retained after analysis because server retention is off."}`}</span></div>
         <div class="scan-footer">
           <button class="primary-button" type="button" data-action="scan-next" ${hasMedia && !mediaLoading ? "" : "disabled"}>Review ${mediaType === "video" ? "video" : "image"} ${icon("arrow")}</button>
         </div>
@@ -920,8 +1046,8 @@
         </div>
         ${
           isRealAnalysis
-            ? `<label class="check-item" for="analysis-consent"><input id="analysis-consent" type="checkbox" ${analysisConsentConfirmed ? "checked" : ""} /><div><strong>Consent and privacy confirmation</strong><span>I confirm this is ${window.isSecureContext ? "test media or the resident/authorized representative consented to this upload" : "non-sensitive test media; I will not upload real resident information over plain HTTP"}, and I reviewed it for faces, voices, labels, and other identifiers.</span></div></label>
-               <div class="demo-banner">${icon("sparkle")}<span><strong>${window.isSecureContext ? "AI-assisted review:" : "Plain HTTP test only:"}</strong> ${!window.isSecureContext ? "This connection is not encrypted; use only non-sensitive test media. " : ""}${mediaType === "video" ? "At most six resized, silent video stills" : "One resized JPEG"} will be sent to the configured backend; raw video and audio stay local. Automated redaction is not active. Derived results and caregiver reviews are saved to this patient's shared workspace. ${window.isSecureContext ? "Use only consented media" : "Use only non-sensitive test media"}, and verify every result in person.</span></div>`
+            ? `<label class="check-item" for="analysis-consent"><input id="analysis-consent" type="checkbox" ${analysisConsentConfirmed ? "checked" : ""} /><div><strong>Consent, privacy, and storage confirmation</strong><span>I confirm this is ${window.isSecureContext ? "test media or the resident/authorized representative consented to this upload" : "non-sensitive test media; I will not upload real resident information over plain HTTP"}, I reviewed it for faces, voices, labels, and other identifiers, and I understand ${session.evidenceRetentionEnabled ? "the prepared JPEG evidence will be stored on this on-prem server" : "the prepared JPEG evidence will not be retained after analysis"}.</span></div></label>
+               <div class="demo-banner">${icon("sparkle")}<span><strong>${window.isSecureContext ? "AI-assisted review:" : "Plain HTTP test only:"}</strong> ${!window.isSecureContext ? "This connection is not encrypted; use only non-sensitive test media. " : ""}${mediaType === "video" ? "At most six resized, silent video frames" : "One resized JPEG"} will be sent to the configured backend and ${session.evidenceRetentionEnabled ? "stored as protected evidence with this patient's on-prem record" : "not retained after analysis"}. ${mediaType === "video" ? "Raw video and audio stay local; the original video and audio are not uploaded or retained." : "The original source file is not retained separately from the prepared JPEG."} Automated redaction is not active. Derived results and caregiver reviews are saved to this patient's shared workspace. ${window.isSecureContext ? "Use only consented media" : "Use only non-sensitive test media"}, and verify every result in person.</span></div>`
             : `<div class="demo-banner">${icon("sparkle")}<span><strong>Prototype mode:</strong> this review returns representative sample observations. It is not running a real vision model on your image or video.</span></div>`
         }
         <p class="media-error" id="analysis-error" role="alert" ${mediaError ? "" : "hidden"}>${escapeHtml(mediaError)}</p>
@@ -1363,6 +1489,7 @@
       durationSeconds: scene.durationSeconds,
       framesSent: scene.framesSent || preparedMedia.frames.length,
       frameTimestamps: scene.frameTimestamps.length ? [...scene.frameTimestamps] : [...preparedMedia.frameTimestamps],
+      media: [...scene.media],
       unableToAssess: scene.unableToAssess,
       assessmentNote: scene.assessmentNote,
       assessmentStatus: scene.assessmentStatus,
@@ -1405,6 +1532,7 @@
       durationSeconds,
       framesSent: 0,
       frameTimestamps: [],
+      media: [],
       unableToAssess: false,
       assessmentNote: null,
       assessmentStatus: "demo",
@@ -1439,6 +1567,9 @@
       : "No selected media was inspected";
     const resultMediaType = currentAnalysisSummary?.mediaType || sourceFinding?.mediaType;
     const resultDuration = currentAnalysisSummary?.durationSeconds ?? sourceFinding?.durationSeconds;
+    const resultStoredMedia = currentResultAggregate
+      ? []
+      : currentAnalysisSummary?.media ?? sourceFinding?.media ?? [];
     const mediaLabel = currentResultAggregate ? "Saved findings" : resultMediaType === "video" ? `Video · ${formatDuration(resultDuration)}` : resultMediaType === "image" ? "Image" : resultSource === "mixed" ? "Saved findings" : "Demo scene";
     return `
       <div class="screen results-top">
@@ -1459,7 +1590,8 @@
               ? `<div class="demo-banner">${icon("info")}<span><strong>Saved review:</strong> Each card identifies whether it came from the illustrated demo or AI-assisted analysis. All still require human review.</span></div>`
               : `<div class="demo-banner">${icon("info")}<span><strong>Representative output:</strong> these findings demonstrate the workflow and were not inferred from your selected image or video. Every finding requires human review.</span></div>`
         }
-        ${isAiResult && currentAnalysisSummary?.source === "ai" && mediaPreview ? `<div class="capture-frame has-image ${resultMediaType === "video" ? "video-media" : ""}" style="min-height:220px">${renderMediaPreview()}<div class="capture-overlay"><span><i class="quality-dot"></i> Source media · not annotated</span><span>Temporary local preview</span></div></div><p class="small muted">This source preview remains only for the current review and is not saved in history.</p>` : ""}
+        ${isAiResult && !currentResultAggregate ? renderStoredMediaGallery(resultStoredMedia, { label: "Stored scene evidence" }) : ""}
+        ${isAiResult && currentAnalysisSummary?.source === "ai" && mediaPreview && !resultStoredMedia.length ? `<div class="capture-frame has-image ${resultMediaType === "video" ? "video-media" : ""}" style="min-height:220px">${renderMediaPreview()}<div class="capture-overlay"><span><i class="quality-dot"></i> Selected source · not annotated</span><span>Temporary local preview</span></div></div><p class="small muted">Evidence retention is off or no stored image is available. This selected-source preview remains only for the current review.</p>` : ""}
         <div class="filter-scroll" aria-label="Filter observations">
           ${categories.map((category) => `<button class="filter-chip ${activeFilter === category ? "active" : ""}" type="button" data-action="filter" data-filter="${escapeHtml(category)}" aria-pressed="${activeFilter === category}">${escapeHtml(category)}</button>`).join("")}
         </div>
@@ -1480,6 +1612,7 @@
     const safeStatus = ["pending", "confirmed", "resolved", "dismissed"].includes(finding.status) ? finding.status : "pending";
     const stateLabel = safeStatus === "pending" ? "Needs review" : safeStatus.charAt(0).toUpperCase() + safeStatus.slice(1);
     const sourceLabel = finding.source === "ai" ? "AI-assisted · verify" : "demo output";
+    const evidenceMedia = storedMediaForFinding(finding);
     return `
       <button class="finding-card" type="button" data-action="open-finding" data-id="${escapeHtml(finding.id)}">
         <div class="finding-top">
@@ -1488,6 +1621,7 @@
             <div class="finding-meta"><span class="status-chip ${finding.urgency}">${escapeHtml(finding.urgencyLabel)}</span><span class="category-chip">${escapeHtml(finding.category)}</span></div>
             <h3>${escapeHtml(finding.title)}</h3>
             <p>${escapeHtml(finding.observed)}</p>
+            ${evidenceMedia.length ? renderStoredMediaItem(evidenceMedia[0], { compact: true, linked: false }) : ""}
           </div>
         </div>
         <div class="finding-status-line"><span class="review-state ${safeStatus}">${stateLabel} · ${sourceLabel}</span><span class="finding-arrow">›</span></div>
@@ -1510,7 +1644,7 @@
     const reviewer = scan.createdBy ? ` · Added by ${displayName(scan.createdBy, "healthcare staff")}` : "";
     return `<div class="activity-row">
       <span class="timeline-icon ${count ? "clean-bg" : "food-bg"}">${icon(count ? "trend" : "check")}</span>
-      <div class="activity-copy"><h3>${escapeHtml(scan.zoneLabel || scan.zone || "Scene")}</h3><p>${escapeHtml(mediaDescription + coverage)} · ${escapeHtml(outcome)}<br>${escapeHtml(displayDate(scan) + reviewer)}</p></div>
+      <div class="activity-copy"><h3>${escapeHtml(scan.zoneLabel || scan.zone || "Scene")}</h3><p>${escapeHtml(mediaDescription + coverage)} · ${escapeHtml(outcome)}<br>${escapeHtml(displayDate(scan) + reviewer)}</p>${renderStoredMediaGallery(scan.media, { compact: true, label: "Protected scene evidence" })}</div>
     </div>`;
   }
 
@@ -1570,7 +1704,7 @@
         <div class="section-heading"><h2>Privacy controls</h2></div>
         <div class="setting-group">
           ${toggleRow("redact", "image", "Request privacy redaction", "Production preference only — editing is not active here", state.settings.redact)}
-          ${toggleRow("retain", "lock", "Keep illustrated demo preview", "AI source media stays only through its current review, then is removed", state.settings.retain)}
+          ${toggleRow("retain", "lock", "Keep illustrated demo preview", "Only affects the local demo; evidence retention is controlled by the on-prem server", state.settings.retain)}
           ${toggleRow("caregiverUpdates", "bell", "Request caregiver updates", "Production preference only — no messages are sent", state.settings.caregiverUpdates)}
         </div>
 
@@ -1585,7 +1719,7 @@
         ${isAdminUser() ? renderStaffAdministration() : ""}
 
         <div class="context-note" style="margin:0 0 18px">
-          ${icon("shield")}<span>AI analysis uploads a resized photo or up to six silent video stills; raw video and audio stay local. Patient scenes and caregiver reviews are stored in the authenticated shared workspace, never in browser storage. Careview is not emergency monitoring.</span>
+          ${icon("shield")}<span>AI analysis uploads a resized JPEG or up to six silent video frames. ${session.evidenceRetentionEnabled ? "Those prepared JPEGs are retained as protected evidence on this on-prem server." : "Prepared JPEG evidence is not retained because server retention is off."} Original video and audio are not uploaded. Patient scenes, evidence metadata, and caregiver reviews remain in the authenticated shared workspace, never in browser storage. Careview is not emergency monitoring.</span>
         </div>
       </div>`;
   }
@@ -1830,13 +1964,18 @@
     const timestamps = Array.isArray(finding.frameTimestamps) ? finding.frameTimestamps.filter(Number.isFinite).slice(0, MAX_VIDEO_FRAMES) : [];
     const evidenceFrames = Array.isArray(finding.evidenceFrameNumbers) ? finding.evidenceFrameNumbers.filter((number) => Number.isInteger(number) && number >= 1 && number <= MAX_VIDEO_FRAMES).slice(0, MAX_VIDEO_FRAMES) : [];
     const evidenceTimestamps = Array.isArray(finding.evidenceTimestamps) ? finding.evidenceTimestamps.filter(Number.isFinite).slice(0, MAX_VIDEO_FRAMES) : [];
+    const storedEvidence = storedMediaForFinding(finding);
     const hasCurrentSourcePreview = Boolean(isAiFinding && currentAnalysisSummary?.source === "ai" && mediaPreview);
     const coverage = finding.mediaType === "video"
       ? `Video ${formatDuration(finding.durationSeconds)} · ${framesSent} silent frame${framesSent === 1 ? "" : "s"} sent${timestamps.length ? ` at ${timestamps.map(formatEvidenceTimestamp).join(", ")}` : ""}${isAiFinding && evidenceFrames.length ? ` · finding cites frame${evidenceFrames.length === 1 ? "" : "s"} ${evidenceFrames.join(", ")}${evidenceTimestamps.length ? ` at ${evidenceTimestamps.map(formatEvidenceTimestamp).join(", ")}` : ""}` : ""}`
       : finding.mediaType === "image" ? `${isAiFinding ? "One resized image sent · finding cites frame 1" : "Image · not inspected"}` : "Illustrative demo evidence";
-    const sourcePreview = hasCurrentSourcePreview
-      ? `<div class="capture-frame has-image ${finding.mediaType === "video" ? "video-media" : ""}" style="min-height:210px">${renderMediaPreview()}<div class="capture-overlay"><span><i class="quality-dot"></i> Source media · not annotated</span><span>Temporary local preview</span></div></div>`
-      : `<div class="evidence-box" role="img" aria-label="${isAiFinding ? "Source media is not retained with this finding" : "Illustrative evidence region for this prototype"}"><span class="evidence-label">${isAiFinding ? "Source media unavailable after this review" : "Illustrative evidence area"}</span></div>`;
+    const sourcePreview = storedEvidence.length
+      ? renderStoredMediaGallery(storedEvidence, { label: "Stored finding evidence" })
+      : hasCurrentSourcePreview
+        ? `<div class="capture-frame has-image ${finding.mediaType === "video" ? "video-media" : ""}" style="min-height:210px">${renderMediaPreview()}<div class="capture-overlay"><span><i class="quality-dot"></i> Selected source · not annotated</span><span>Temporary local preview</span></div></div><p class="small muted">No stored evidence is available; this selected-source preview will be removed after the current review.</p>`
+        : isAiFinding
+          ? renderStoredMediaGallery([], { label: "Stored finding evidence" })
+          : `<div class="evidence-box" role="img" aria-label="Illustrative evidence region for this prototype"><span class="evidence-label">Illustrative evidence area</span></div>`;
     sheetReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     sheet.innerHTML = `
       <div class="sheet-grabber" aria-hidden="true"></div>
@@ -1855,7 +1994,7 @@
       <label class="note-label" for="caregiver-note">Caregiver note</label>
       <textarea class="note-input" id="caregiver-note" placeholder="Add what you verified in person…">${escapeHtml(finding.note || "")}</textarea>
       ${finding.reviewedBy ? `<p class="small muted">Last reviewed by ${escapeHtml(displayName(finding.reviewedBy, "healthcare staff"))}${finding.updatedAt ? ` · ${escapeHtml(displayDate({ timestamp: finding.updatedAt }))}` : ""}</p>` : ""}
-      <p class="small muted">Use Confirm only after checking the source preview or verifying the condition in person. A saved AI card without source media is not sufficient evidence.</p>
+      <p class="small muted">Use Confirm only after checking the stored evidence or verifying the condition in person. A saved AI card without accessible evidence is not sufficient by itself.</p>
       <div class="review-actions" role="group" aria-label="Review status">
         <button class="review-action ${finding.status === "confirmed" ? "active" : ""}" type="button" data-action="set-review" data-status="confirmed" aria-pressed="${finding.status === "confirmed"}">Confirm in person</button>
         <button class="review-action ${finding.status === "resolved" ? "active" : ""}" type="button" data-action="set-review" data-status="resolved" aria-pressed="${finding.status === "resolved"}">Resolved</button>
@@ -2135,6 +2274,11 @@
 
     if (kind === "login" || kind === "setup") {
       if (authBusy) return;
+      const setupToken = kind === "setup" ? String(formData.get("setupToken") || "").trim() : "";
+      if (kind === "setup") {
+        const setupTokenInput = form.elements.namedItem("setupToken");
+        if (setupTokenInput instanceof HTMLInputElement) setupTokenInput.value = "";
+      }
       authDraft.email = String(formData.get("email") || "").trim();
       authDraft.workspaceName = kind === "setup" ? String(formData.get("workspaceName") || "").trim() : "";
       authDraft.displayName = kind === "setup" ? String(formData.get("displayName") || "").trim() : "";
@@ -2150,7 +2294,9 @@
         body.displayName = String(formData.get("displayName") || "").trim();
       }
       try {
-        await apiFetch(kind === "setup" ? "/api/setup" : "/api/login", { method: "POST", body: JSON.stringify(body) });
+        const requestOptions = { method: "POST", body: JSON.stringify(body) };
+        if (kind === "setup") requestOptions.headers = { "X-Careview-Setup-Token": setupToken };
+        await apiFetch(kind === "setup" ? "/api/setup" : "/api/login", requestOptions);
         authBusy = false;
         authDraft = { workspaceName: "", displayName: "", email: "" };
         await bootstrapSession();
@@ -2420,6 +2566,8 @@
   });
 
   sheetBackdrop.addEventListener("click", () => closeSheet());
+  app.addEventListener("error", handleStoredMediaError, true);
+  sheet.addEventListener("error", handleStoredMediaError, true);
   window.addEventListener("popstate", (event) => {
     if (analysisTimer || analysisController) cancelActiveAnalysis();
     const historyState = event.state || { route: "home", scanStep: 1 };

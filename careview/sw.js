@@ -1,5 +1,5 @@
 const CACHE_PREFIX = "careview-";
-const CACHE_NAME = `${CACHE_PREFIX}v9`;
+const CACHE_NAME = `${CACHE_PREFIX}v10`;
 const APP_SHELL = [
   "./index.html",
   "./styles.css",
@@ -39,6 +39,8 @@ self.addEventListener("fetch", (event) => {
 
   const requestUrl = new URL(event.request.url);
   if (requestUrl.origin !== self.location.origin) return;
+  // Authenticated records and stored evidence must always go to the server;
+  // neither API JSON nor protected media belongs in the offline app-shell cache.
   if (requestUrl.pathname.startsWith("/api/")) return;
 
   if (event.request.mode === "navigate") {

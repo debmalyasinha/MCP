@@ -1,8 +1,12 @@
 import base64
+import hashlib
 import http.client
+import io
 import json
 import os
+import re
 import socket
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -18,14 +22,38 @@ sys.path.insert(0, str(ROOT))
 import server  # noqa: E402
 
 
-def data_url(payload=b"small-image", mime="image/jpeg"):
-    signatures = {
-        "image/jpeg": b"\xff\xd8\xff",
-        "image/png": b"\x89PNG\r\n\x1a\n",
-        "image/webp": b"RIFF\x08\x00\x00\x00WEBP",
-        "image/gif": b"GIF89a",
-    }
-    content = signatures.get(mime, b"") + payload
+TEST_SETUP_TOKEN = "test-setup-token-0123456789"
+JPEG_FIXTURE = base64.b64decode(
+    "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoM"
+    "DAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsN"
+    "FBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBT/wAAR"
+    "CAADAAIDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAA"
+    "AgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkK"
+    "FhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWG"
+    "h4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl"
+    "5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREA"
+    "AgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYk"
+    "NOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOE"
+    "hYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk"
+    "5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD8rZ55LmaSaaRpZZGLvI7EszE5JJPUmiii"
+    "jbRDbcm23ds//9k="
+)
+
+
+def data_url(payload=b"", mime="image/jpeg"):
+    if mime == "image/jpeg":
+        content = JPEG_FIXTURE
+        if payload:
+            # Inject metadata that the server must strip before forwarding or retention.
+            app1 = b"\xff\xe1" + (len(payload) + 2).to_bytes(2, "big") + payload
+            content = content[:2] + app1 + content[2:]
+    else:
+        signatures = {
+            "image/png": b"\x89PNG\r\n\x1a\n",
+            "image/webp": b"RIFF\x08\x00\x00\x00WEBP",
+            "image/gif": b"GIF89a",
+        }
+        content = signatures.get(mime, b"") + payload
     return f"data:{mime};base64,{base64.b64encode(content).decode('ascii')}"
 
 
@@ -39,8 +67,8 @@ def image_payload(**changes):
             {
                 "dataUrl": data_url(),
                 "timestampSeconds": 0,
-                "width": 800,
-                "height": 600,
+                "width": 2,
+                "height": 3,
             }
         ],
     }
@@ -55,8 +83,8 @@ def video_payload():
         "mediaType": "video",
         "durationSeconds": 3,
         "frames": [
-            {"dataUrl": data_url(b"frame-one", "image/png"), "timestampSeconds": 0},
-            {"dataUrl": data_url(b"frame-two", "image/webp"), "timestampSeconds": 2.5},
+            {"dataUrl": data_url(b"frame-one"), "timestampSeconds": 0},
+            {"dataUrl": data_url(b"frame-two"), "timestampSeconds": 2.5},
         ],
     }
 
@@ -79,6 +107,13 @@ def model_result(**changes):
         ],
     }
     result.update(changes)
+    return result
+
+
+def image_model_result(**changes):
+    result = model_result(**changes)
+    for finding in result.get("findings", []):
+        finding["evidenceFrameNumbers"] = [1]
     return result
 
 
@@ -109,18 +144,30 @@ class FakeResponse:
 
 
 @contextmanager
-def running_server():
-    with tempfile.TemporaryDirectory() as temporary:
-        db_path = Path(temporary) / "careview.db"
-        httpd = server.create_server("127.0.0.1", 0, ROOT, db_path)
-        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-        thread.start()
-        try:
-            yield httpd.server_port
-        finally:
-            httpd.shutdown()
-            httpd.server_close()
-            thread.join(timeout=2)
+def running_server(*, db_path=None, media_root=None, retain_evidence=False):
+    temporary = None
+    if db_path is None:
+        temporary = tempfile.TemporaryDirectory()
+        db_path = Path(temporary.name) / "careview.db"
+    httpd = server.create_server(
+        "127.0.0.1",
+        0,
+        ROOT,
+        Path(db_path),
+        media_root=media_root,
+        retain_evidence=retain_evidence,
+        setup_token=TEST_SETUP_TOKEN,
+    )
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield httpd.server_port
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=2)
+        if temporary is not None:
+            temporary.cleanup()
 
 
 def request(port, method, path, body=None, headers=None):
@@ -171,6 +218,7 @@ class ApiClient:
                 "email": email,
                 "password": password,
             },
+            headers={server.SETUP_TOKEN_HEADER: TEST_SETUP_TOKEN},
         )
 
     def login(self, email, password):
@@ -189,7 +237,28 @@ class ValidationTests(unittest.TestCase):
 
         self.assertIsNone(image.frames[0].timestamp_ms)
         self.assertEqual((video.frames[0].timestamp_ms, video.frames[1].timestamp_ms), (0, 2500))
-        self.assertEqual((image.frames[0].width, image.frames[0].height), (800, 600))
+        self.assertEqual((image.frames[0].width, image.frames[0].height), (2, 3))
+        self.assertNotIn(b"frame-one", video.frames[0].data)
+        self.assertEqual(video.frames[0].mime_type, "image/jpeg")
+
+    def test_jpeg_dimensions_are_server_derived_and_metadata_is_removed(self):
+        marker = b"private-exif-like-metadata"
+        payload = image_payload()
+        payload["frames"][0]["dataUrl"] = data_url(marker)
+        payload["frames"][0].pop("width")
+        payload["frames"][0].pop("height")
+        validated = server.validate_analysis_payload(payload)
+
+        self.assertEqual((validated.frames[0].width, validated.frames[0].height), (2, 3))
+        self.assertNotIn(marker, validated.frames[0].data)
+        self.assertNotIn(marker.decode("ascii"), validated.frames[0].data_url)
+        self.assertTrue(validated.frames[0].data.startswith(b"\xff\xd8"))
+        self.assertTrue(validated.frames[0].data.endswith(b"\xff\xd9"))
+
+        payload["frames"][0]["width"] = 3
+        payload["frames"][0]["height"] = 3
+        with self.assertRaises(server.RequestValidationError):
+            server.validate_analysis_payload(payload)
 
     def test_rejects_unknown_zone_fields_and_raw_video(self):
         bad_zone = image_payload(zone="bedroom")
@@ -205,6 +274,11 @@ class ValidationTests(unittest.TestCase):
         raw_video["frames"][0]["dataUrl"] = data_url(b"video", "video/mp4")
         with self.assertRaises(server.RequestValidationError):
             server.validate_analysis_payload(raw_video)
+
+        raw_png = image_payload()
+        raw_png["frames"][0]["dataUrl"] = data_url(b"pixels", "image/png")
+        with self.assertRaises(server.RequestValidationError):
+            server.validate_analysis_payload(raw_png)
 
     def test_rejects_bad_counts_base64_and_timestamps(self):
         too_many = video_payload()
@@ -228,6 +302,14 @@ class ValidationTests(unittest.TestCase):
         )
         with self.assertRaises(server.RequestValidationError):
             server.validate_analysis_payload(wrong_signature)
+
+        truncated = image_payload()
+        truncated["frames"][0]["dataUrl"] = (
+            "data:image/jpeg;base64,"
+            + base64.b64encode(JPEG_FIXTURE[:-12]).decode("ascii")
+        )
+        with self.assertRaises(server.RequestValidationError):
+            server.validate_analysis_payload(truncated)
 
 
 class NormalizationTests(unittest.TestCase):
@@ -335,7 +417,14 @@ class EndpointTests(unittest.TestCase):
 
             status, _, session = ApiClient(port).request("GET", "/api/session")
             self.assertEqual(status, 200)
-            self.assertEqual(session, {"authenticated": False, "setupRequired": True})
+            self.assertEqual(
+                session,
+                {
+                    "authenticated": False,
+                    "setupRequired": True,
+                    "evidenceRetentionEnabled": False,
+                },
+            )
 
             status, headers, body = request(port, "GET", "/")
             self.assertEqual(status, 200)
@@ -351,6 +440,9 @@ class EndpointTests(unittest.TestCase):
                 "/scripts/generate-icons.py",
                 "/__pycache__/server.pyc",
                 "/../server.py",
+                "/private-data/.careview-storage.json",
+                "/private-data/careview.db",
+                f"/private-data/media/aa/{'a' * 64}",
             ):
                 status, _, _ = request(port, "GET", path)
                 self.assertEqual(status, 404, path)
@@ -392,6 +484,61 @@ class EndpointTests(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertIn("Max-Age=0", headers["Set-Cookie"])
 
+    def test_data_root_instance_lock_prevents_a_second_server(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            db_path = Path(temporary) / "careview.db"
+            first = server.create_server(
+                "127.0.0.1", 0, ROOT, db_path, setup_token=TEST_SETUP_TOKEN
+            )
+            try:
+                with self.assertRaisesRegex(RuntimeError, "already using data root"):
+                    server.create_server(
+                        "127.0.0.1", 0, ROOT, db_path, setup_token=TEST_SETUP_TOKEN
+                    )
+            finally:
+                first.server_close()
+
+            second = server.create_server(
+                "127.0.0.1", 0, ROOT, db_path, setup_token=TEST_SETUP_TOKEN
+            )
+            second.server_close()
+
+    def test_non_loopback_cli_requires_explicit_synthetic_http_mode(self):
+        invalid_arguments = (
+            ["server.py", "--bind", "0.0.0.0"],
+            [
+                "server.py",
+                "--bind",
+                "0.0.0.0",
+                "--allow-insecure-lan-testing",
+                "--secure-cookie",
+            ],
+            [
+                "server.py",
+                "--bind",
+                "0.0.0.0",
+                "--allow-insecure-lan-testing",
+                "--retain-evidence",
+            ],
+            [
+                "server.py",
+                "--bind",
+                "0.0.0.0",
+                "--allow-insecure-lan-testing",
+                "--database",
+                str(ROOT / "custom.db"),
+            ],
+        )
+        for arguments in invalid_arguments:
+            with self.subTest(arguments=arguments), patch.object(
+                sys, "argv", arguments
+            ), self.assertRaises(SystemExit):
+                server.main()
+
+        self.assertTrue(server._is_loopback_bind("127.0.0.1"))
+        self.assertTrue(server._is_loopback_bind("::1"))
+        self.assertFalse(server._is_loopback_bind("0.0.0.0"))
+
     def test_session_and_csrf_survive_store_restart_without_raw_tokens_in_database(self):
         with tempfile.TemporaryDirectory() as temporary:
             db_path = Path(temporary) / "restart.db"
@@ -410,16 +557,34 @@ class EndpointTests(unittest.TestCase):
             self.assertNotIn(session_token.encode("ascii"), database_bytes)
             self.assertNotIn(csrf_token.encode("ascii"), database_bytes)
 
-    def test_setup_rejects_non_loopback_bootstrap(self):
-        class NonLoopback:
-            is_loopback = False
-
-        with running_server() as port, patch.object(
-            server.ipaddress, "ip_address", return_value=NonLoopback()
-        ):
-            status, _, body = ApiClient(port).setup(password=self.password)
+    def test_setup_requires_the_out_of_band_one_time_token(self):
+        with running_server() as port:
+            status, _, body = ApiClient(port).request(
+                "POST",
+                "/api/setup",
+                {
+                    "workspaceName": "Northstar Care",
+                    "displayName": "Alex Admin",
+                    "email": "admin@example.test",
+                    "password": self.password,
+                },
+            )
             self.assertEqual(status, 403)
-            self.assertEqual(body["error"]["code"], "setup_local_only")
+            self.assertEqual(body["error"]["code"], "setup_token_invalid")
+
+            status, _, body = ApiClient(port).request(
+                "POST",
+                "/api/setup",
+                {
+                    "workspaceName": "Northstar Care",
+                    "displayName": "Alex Admin",
+                    "email": "admin@example.test",
+                    "password": self.password,
+                },
+                headers={server.SETUP_TOKEN_HEADER: "wrong-token-0000000000"},
+            )
+            self.assertEqual(status, 403)
+            self.assertEqual(body["error"]["code"], "setup_token_invalid")
 
     def test_admin_created_staff_login_and_admin_authorization(self):
         with running_server() as port:
@@ -507,6 +672,7 @@ class EndpointTests(unittest.TestCase):
             self.assertEqual(body["assessmentOutcome"], "findings_present")
             self.assertEqual(body["framesSubmitted"], 2)
             scene = body["scene"]
+            self.assertEqual(scene["media"], [])
             self.assertEqual(scene["patientId"], patient["id"])
             self.assertEqual(scene["createdBy"]["displayName"], "Alex Admin")
             self.assertTrue(scene["createdAt"])
@@ -546,6 +712,278 @@ class EndpointTests(unittest.TestCase):
             )
             self.assertEqual(status, 409, conflict)
             self.assertEqual(conflict["error"]["currentFinding"]["version"], 2)
+
+    def test_retained_evidence_persists_across_restart_and_is_not_in_database(self):
+        marker = b"careview-private-evidence-marker-49a3"
+        payload = image_payload()
+        payload["frames"][0]["dataUrl"] = data_url(marker)
+        expected_bytes = server.validate_analysis_payload(payload).frames[0].data
+        self.assertNotIn(marker, expected_bytes)
+
+        def fake_urlopen(upstream_request, timeout):
+            return FakeResponse(responses_envelope(image_model_result()))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            db_path = root / "careview.db"
+            media_root = root / "private-media"
+            with patch.dict(
+                os.environ,
+                {"OPENAI_API_KEY": "server-secret", "OPENAI_MODEL": "test-vision-model"},
+                clear=True,
+            ), patch.object(server, "urlopen", side_effect=fake_urlopen), running_server(
+                db_path=db_path, media_root=media_root, retain_evidence=True
+            ) as port:
+                client = ApiClient(port)
+                status, _, initial_session = client.request("GET", "/api/session")
+                self.assertEqual(status, 200, initial_session)
+                self.assertTrue(initial_session["evidenceRetentionEnabled"])
+                self.assertEqual(client.setup(password=self.password)[0], 201)
+                patient = self.create_patient(client, "Private Test Patient")
+
+                status, _, body = client.request(
+                    "POST", f"/api/patients/{patient['id']}/analyze", payload, csrf=True
+                )
+                self.assertEqual(status, 200, body)
+                scene = body["scene"]
+                self.assertEqual(len(scene["media"]), 1)
+                media = scene["media"][0]
+                self.assertEqual(media["mimeType"], "image/jpeg")
+                self.assertEqual(media["byteSize"], len(expected_bytes))
+                self.assertEqual(media["sha256"], hashlib.sha256(expected_bytes).hexdigest())
+                self.assertEqual((media["width"], media["height"]), (2, 3))
+                self.assertEqual(media["frameNumber"], 1)
+                self.assertIsNone(media["timestampMs"])
+                self.assertEqual(media["createdBy"]["displayName"], "Alex Admin")
+                self.assertNotIn("objectKey", media)
+                self.assertNotIn(str(media_root), json.dumps(scene))
+
+                status, headers, downloaded = client.request("GET", media["url"])
+                self.assertEqual(status, 200)
+                self.assertEqual(downloaded, expected_bytes)
+                self.assertEqual(headers["Content-Type"], "image/jpeg")
+                self.assertEqual(headers["Cache-Control"], "no-store")
+                self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+                self.assertEqual(headers["Cross-Origin-Resource-Policy"], "same-origin")
+
+                stored_files = [item for item in media_root.rglob("*") if item.is_file()]
+                self.assertEqual(len(stored_files), 1)
+                self.assertRegex(stored_files[0].name, r"\A[a-f0-9]{64}\Z")
+                relative_parts = stored_files[0].relative_to(media_root).parts
+                self.assertTrue(
+                    all(
+                        re.fullmatch(r"[a-f0-9]{2}|[a-f0-9]{64}", part)
+                        for part in relative_parts
+                    )
+                )
+                cookie, csrf = client.cookie, client.csrf
+
+            database_files = [db_path, db_path.with_name(f"{db_path.name}-wal")]
+            for database_file in database_files:
+                if database_file.exists():
+                    self.assertNotIn(marker, database_file.read_bytes())
+
+            with running_server(
+                db_path=db_path, media_root=media_root, retain_evidence=True
+            ) as restarted_port:
+                restarted = ApiClient(restarted_port)
+                restarted.cookie = cookie
+                restarted.csrf = csrf
+                status, _, history = restarted.request(
+                    "GET", f"/api/patients/{patient['id']}/scenes"
+                )
+                self.assertEqual(status, 200, history)
+                restarted_media = history["scenes"][0]["media"][0]
+                self.assertEqual(restarted_media["id"], media["id"])
+                status, _, downloaded = restarted.request("GET", restarted_media["url"])
+                self.assertEqual(status, 200)
+                self.assertEqual(downloaded, expected_bytes)
+
+    def test_media_endpoint_denies_other_workspace_patient_and_traversal(self):
+        def fake_urlopen(upstream_request, timeout):
+            return FakeResponse(responses_envelope(image_model_result()))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            db_path = root / "careview.db"
+            media_root = root / "media"
+            with patch.dict(os.environ, {"OPENAI_API_KEY": "secret"}, clear=True), patch.object(
+                server, "urlopen", side_effect=fake_urlopen
+            ), running_server(
+                db_path=db_path, media_root=media_root, retain_evidence=True
+            ) as port:
+                primary = ApiClient(port)
+                self.assertEqual(primary.setup(password=self.password)[0], 201)
+                patient = self.create_patient(primary)
+                status, _, analysis = primary.request(
+                    "POST",
+                    f"/api/patients/{patient['id']}/analyze",
+                    image_payload(),
+                    csrf=True,
+                )
+                self.assertEqual(status, 200, analysis)
+                scene = analysis["scene"]
+                media = scene["media"][0]
+
+                # Add a separate workspace account using an existing valid password hash.
+                connection = sqlite3.connect(db_path)
+                try:
+                    source = connection.execute(
+                        "SELECT password_salt, password_hash FROM users WHERE email = ?",
+                        ("admin@example.test",),
+                    ).fetchone()
+                    other_workspace = "b" * 32
+                    other_user = "c" * 32
+                    connection.execute(
+                        "INSERT INTO workspaces VALUES (?, ?, ?)",
+                        (other_workspace, "Other Workspace", "2026-01-01T00:00:00Z"),
+                    )
+                    connection.execute(
+                        """INSERT INTO users VALUES
+                           (?, ?, ?, ?, ?, ?, 'admin', 1, ?)""",
+                        (
+                            other_user,
+                            other_workspace,
+                            "Other Admin",
+                            "other@example.test",
+                            source[0],
+                            source[1],
+                            "2026-01-01T00:00:00Z",
+                        ),
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+
+                outsider = ApiClient(port)
+                self.assertEqual(
+                    outsider.login("other@example.test", self.password)[0], 200
+                )
+                status, _, body = outsider.request("GET", media["url"])
+                self.assertEqual(status, 404, body)
+                self.assertEqual(body["error"]["code"], "not_found")
+
+                wrong_patient_url = media["url"].replace(patient["id"], "d" * 32, 1)
+                status, _, body = primary.request("GET", wrong_patient_url)
+                self.assertEqual(status, 404, body)
+
+                traversal = (
+                    f"/api/patients/{patient['id']}/scenes/{scene['id']}"
+                    "/media/%2e%2e%2fcareview.db"
+                )
+                status, _, body = primary.request("GET", traversal)
+                self.assertEqual(status, 404, body)
+                with self.assertRaises(server.EvidenceStorageError):
+                    server._media_object_path(media_root, "../careview.db")
+
+    def test_startup_reconciles_only_recognizable_orphan_and_staging_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            db_path = root / "careview.db"
+            media_root = root / "media"
+            with running_server(db_path=db_path, media_root=media_root):
+                pass
+
+            orphan_key = "a" * 64
+            orphan = media_root / orphan_key[:2] / orphan_key
+            orphan.parent.mkdir(parents=True)
+            orphan.write_bytes(b"orphaned-after-rename")
+            staged = media_root / ".staging" / ("b" * 64 + ".tmp")
+            staged.parent.mkdir(parents=True)
+            staged.write_bytes(b"interrupted-staging")
+
+            unexpected_root_file = media_root / "operator-note.txt"
+            unexpected_root_file.write_text("preserve", encoding="utf-8")
+            unexpected_staging = staged.parent / "operator-note.tmp"
+            unexpected_staging.write_text("preserve", encoding="utf-8")
+            wrong_prefix = media_root / "cc" / ("d" * 64)
+            wrong_prefix.parent.mkdir(parents=True)
+            wrong_prefix.write_bytes(b"preserve")
+            nested_directory = media_root / "ee" / ("e" * 64)
+            nested_directory.mkdir(parents=True)
+            nested_child = nested_directory / "preserve.txt"
+            nested_child.write_text("preserve", encoding="utf-8")
+
+            # Reconciliation is strictly tied to retained-evidence mode.
+            with running_server(
+                db_path=db_path, media_root=media_root, retain_evidence=False
+            ):
+                pass
+            self.assertTrue(orphan.exists())
+            self.assertTrue(staged.exists())
+
+            reconciliation_log = io.StringIO()
+            with patch.object(server.sys, "stderr", reconciliation_log), running_server(
+                db_path=db_path, media_root=media_root, retain_evidence=True
+            ):
+                pass
+
+            self.assertFalse(orphan.exists())
+            self.assertFalse(staged.exists())
+            self.assertTrue(unexpected_root_file.exists())
+            self.assertTrue(unexpected_staging.exists())
+            self.assertTrue(wrong_prefix.exists())
+            self.assertTrue(nested_child.exists())
+            log = reconciliation_log.getvalue()
+            self.assertIn(orphan_key, log)
+            self.assertIn(staged.name, log)
+            self.assertIn("1 orphan object(s), 1 staging file(s) removed", log)
+
+    def test_failed_analysis_and_database_failure_leave_no_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            db_path = root / "careview.db"
+            media_root = root / "media"
+            with patch.dict(os.environ, {"OPENAI_API_KEY": "secret"}, clear=True), running_server(
+                db_path=db_path, media_root=media_root, retain_evidence=True
+            ) as port:
+                client = ApiClient(port)
+                self.assertEqual(client.setup(password=self.password)[0], 201)
+                patient = self.create_patient(client)
+                with patch.object(
+                    server, "urlopen", side_effect=server.URLError("provider failed")
+                ):
+                    status, _, body = client.request(
+                        "POST",
+                        f"/api/patients/{patient['id']}/analyze",
+                        image_payload(),
+                        csrf=True,
+                    )
+                self.assertEqual(status, 502, body)
+                self.assertFalse(media_root.exists())
+                connection = sqlite3.connect(db_path)
+                try:
+                    self.assertEqual(
+                        connection.execute("SELECT COUNT(*) FROM scenes").fetchone()[0],
+                        0,
+                    )
+                    self.assertEqual(
+                        connection.execute("SELECT COUNT(*) FROM scene_media").fetchone()[0],
+                        0,
+                    )
+                finally:
+                    connection.close()
+
+                with patch.object(
+                    server,
+                    "urlopen",
+                    return_value=FakeResponse(responses_envelope(image_model_result())),
+                ), patch.object(
+                    server.CareviewStore,
+                    "create_scene",
+                    side_effect=RuntimeError("db failed"),
+                ):
+                    status, _, body = client.request(
+                        "POST",
+                        f"/api/patients/{patient['id']}/analyze",
+                        image_payload(),
+                        csrf=True,
+                    )
+                self.assertEqual(status, 500, body)
+                self.assertEqual(body["error"]["code"], "evidence_storage_failed")
+                self.assertEqual(
+                    [item for item in media_root.rglob("*") if item.is_file()], []
+                )
 
     def test_missing_key_and_content_type_fail_safely_after_authorization(self):
         with patch.dict(os.environ, {}, clear=True), running_server() as port:

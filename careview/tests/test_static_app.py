@@ -44,6 +44,14 @@ class StaticAppTests(unittest.TestCase):
         for name in ("index.html", "styles.css", "app.js", "manifest.webmanifest", "sw.js", "icon.svg", "icon-192.png", "icon-512.png", "apple-touch-icon.png", "README.md"):
             self.assertTrue((ROOT / name).is_file(), name)
 
+    def test_embedded_private_data_directory_is_git_ignored(self):
+        ignored = {
+            line.strip()
+            for line in (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+        self.assertIn("/private-data/", ignored)
+
     def test_app_shell_has_expected_mount_points(self):
         self.assertTrue({"app", "toast", "bottom-sheet", "sheet-backdrop"}.issubset(self.parser.ids))
         self.assertTrue(any(script.get("src") == "app.js" for script in self.parser.scripts))
@@ -261,6 +269,43 @@ class StaticAppTests(unittest.TestCase):
         self.assertIn("uppercase, lowercase, a number, and a symbol", self.js)
         self.assertNotIn('minlength="8"', self.js)
 
+    def test_initial_setup_token_is_required_transient_and_header_only(self):
+        setup_markup = self.js[
+            self.js.index('for="setup-token"') : self.js.index('for="workspace-name"')
+        ]
+        for hook in (
+            'id="setup-token"',
+            'name="setupToken"',
+            'type="password"',
+            'autocomplete="off"',
+            'required',
+            'printed only in the server console',
+            'expires after setup or a server restart',
+        ):
+            self.assertIn(hook, setup_markup)
+
+        submit_handler = self.js[
+            self.js.index('if (kind === "login" || kind === "setup")') : self.js.index('if (kind === "add-patient")')
+        ]
+        self.assertIn('formData.get("setupToken")', submit_handler)
+        self.assertIn('setupTokenInput.value = ""', submit_handler)
+        self.assertIn('requestOptions.headers = { "X-Careview-Setup-Token": setupToken }', submit_handler)
+        body_block = submit_handler[
+            submit_handler.index("const body = {") : submit_handler.index("try {")
+        ]
+        self.assertNotIn("setupToken", body_block)
+        self.assertNotIn("setupToken", re.search(
+            r"function savePreferences\(\) \{(.+?)\n  \}", self.js, re.DOTALL
+        ).group(0))
+
+        readme = re.sub(r"\s+", " ", self.readme.lower())
+        for phrase in (
+            "one-time initial-setup token only in its console",
+            "expires as soon as setup succeeds or the server restarts",
+            "use the new token printed by the new server process",
+        ):
+            self.assertIn(phrase, readme)
+
     def test_failed_logout_preserves_the_active_local_session(self):
         sign_out = self.js[
             self.js.index("async function signOut()") : self.js.index("async function saveFindingReview()")
@@ -345,6 +390,64 @@ class StaticAppTests(unittest.TestCase):
 
     def test_service_worker_never_intercepts_api_requests(self):
         self.assertIn('requestUrl.pathname.startsWith("/api/")', self.worker)
+        self.assertIn("protected media belongs in the offline app-shell cache", self.worker)
+        self.assertNotIn('"/api/"', re.search(r"const APP_SHELL = \[(.+?)\];", self.worker, re.DOTALL).group(0))
+
+    def test_stored_scene_media_contract_is_normalized_and_patient_scoped(self):
+        for hook in (
+            "function normalizeStoredMedia(rawMedia, index)",
+            "rawScene?.media",
+            "rawMedia.slice(0, MAX_VIDEO_FRAMES).map(normalizeStoredMedia).filter(Boolean)",
+            "media: scene.media",
+            "media: [...scene.media]",
+            "media.frameNumber",
+            "media.timestampSeconds",
+            "rawMedia.timestampMs ?? rawMedia.timestamp_ms",
+            "Number(rawTimestampMilliseconds) / 1000",
+            "media.byteSize",
+            "media.mimeType",
+        ):
+            self.assertIn(hook, self.js)
+        url_guard = self.js[
+            self.js.index("function normalizeAuthorizedMediaUrl") : self.js.index("function normalizeStoredMedia")
+        ]
+        self.assertIn("url.origin !== window.location.origin", url_guard)
+        self.assertIn('!url.pathname.startsWith("/api/")', url_guard)
+        self.assertIn("/media\\/[^/]+$", url_guard)
+
+    def test_stored_evidence_is_lazy_private_and_gracefully_missing(self):
+        for hook in (
+            'loading="lazy"',
+            'decoding="async"',
+            'referrerpolicy="no-referrer"',
+            'rel="noopener noreferrer"',
+            "Private patient record",
+            "Authorized staff only",
+            "No stored image available",
+            "handleStoredMediaError",
+            "renderStoredMediaGallery(resultStoredMedia",
+            "renderStoredMediaGallery(scan.media",
+            "storedMediaForFinding(finding)",
+        ):
+            self.assertIn(hook, self.js)
+        self.assertIn(".stored-media-grid", self.css)
+        self.assertIn(".stored-media-empty", self.css)
+        self.assertIn("object-fit: contain", self.css)
+
+    def test_evidence_retention_disclosure_comes_from_server_session(self):
+        self.assertIn("evidenceRetentionEnabled: payload.evidenceRetentionEnabled === true", self.js)
+        self.assertIn("Prepared JPEG evidence will be stored", self.js)
+        self.assertIn("Prepared JPEG evidence is not retained", self.js)
+        self.assertIn("original video and audio are not uploaded or retained", self.js.lower())
+        self.assertIn("Consent, privacy, and storage confirmation", self.js)
+
+    def test_protected_media_is_never_added_to_browser_storage(self):
+        save_preferences = re.search(
+            r"function savePreferences\(\) \{(.+?)\n  \}", self.js, re.DOTALL
+        ).group(0)
+        for forbidden in ("media", "url", "patient", "scene", "finding", "csrf"):
+            self.assertNotIn(forbidden, save_preferences.lower())
+        self.assertNotIn("sessionStorage", self.js)
 
     def test_readme_documents_server_side_ai_setup_and_prototype_limits(self):
         normalized = self.readme.lower()

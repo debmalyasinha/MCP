@@ -1,7 +1,8 @@
 """Authenticated, workspace-scoped persistence for the Careview prototype.
 
-Only derived scene-review records are stored. Source images and video frames are
-never passed to this module.
+Only derived scene-review records and evidence metadata are stored here. Image
+bytes remain in the private filesystem media store and are never written to
+SQLite.
 """
 
 from __future__ import annotations
@@ -47,6 +48,9 @@ class ConflictError(RuntimeError):
 
 EMAIL_RE = re.compile(r"\A[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,63}\Z")
 OPAQUE_ID_RE = re.compile(r"\A[a-f0-9]{32}\Z")
+MEDIA_OBJECT_KEY_RE = re.compile(r"\A[a-f0-9]{64}\Z")
+SHA256_RE = re.compile(r"\A[a-f0-9]{64}\Z")
+ALLOWED_MEDIA_MIMES = {"image/jpeg"}
 PASSWORD_SCRYPT_N = 2**14
 SESSION_SECONDS = 8 * 60 * 60
 
@@ -192,6 +196,24 @@ class CareviewStore:
                 );
                 CREATE INDEX IF NOT EXISTS scenes_patient_created
                     ON scenes(workspace_id, patient_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS scene_media (
+                    id TEXT PRIMARY KEY,
+                    workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+                    patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+                    scene_id TEXT NOT NULL REFERENCES scenes(id) ON DELETE CASCADE,
+                    object_key TEXT NOT NULL UNIQUE,
+                    mime_type TEXT NOT NULL,
+                    byte_size INTEGER NOT NULL CHECK (byte_size > 0),
+                    sha256 TEXT NOT NULL,
+                    width INTEGER,
+                    height INTEGER,
+                    frame_number INTEGER NOT NULL CHECK (frame_number > 0),
+                    timestamp_ms INTEGER,
+                    created_by TEXT NOT NULL REFERENCES users(id),
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS scene_media_scene
+                    ON scene_media(workspace_id, patient_id, scene_id, frame_number);
                 CREATE TABLE IF NOT EXISTS findings (
                     id TEXT PRIMARY KEY,
                     workspace_id TEXT NOT NULL REFERENCES workspaces(id),
@@ -555,6 +577,28 @@ class CareviewStore:
         )
         return value
 
+    @staticmethod
+    def _public_media(row: sqlite3.Row) -> dict[str, Any]:
+        patient_id = row["patient_id"]
+        scene_id = row["scene_id"]
+        media_id = row["id"]
+        return {
+            "id": media_id,
+            "url": f"/api/patients/{patient_id}/scenes/{scene_id}/media/{media_id}",
+            "mimeType": row["mime_type"],
+            "byteSize": row["byte_size"],
+            "sha256": row["sha256"],
+            "width": row["width"],
+            "height": row["height"],
+            "frameNumber": row["frame_number"],
+            "timestampMs": row["timestamp_ms"],
+            "createdAt": row["created_at"],
+            "createdBy": {
+                "id": row["created_by"],
+                "displayName": row["media_creator_name"],
+            },
+        }
+
     def _scene_from_row(
         self, connection: sqlite3.Connection, row: sqlite3.Row
     ) -> dict[str, Any]:
@@ -563,6 +607,13 @@ class CareviewStore:
             """SELECT findings.*, users.display_name AS reviewer_name
                FROM findings LEFT JOIN users ON users.id = findings.reviewed_by
                WHERE findings.scene_id = ? ORDER BY findings.created_at, findings.id""",
+            (row["id"],),
+        ).fetchall()
+        media_rows = connection.execute(
+            """SELECT scene_media.*, users.display_name AS media_creator_name
+               FROM scene_media JOIN users ON users.id = scene_media.created_by
+               WHERE scene_media.scene_id = ?
+               ORDER BY scene_media.frame_number, scene_media.id""",
             (row["id"],),
         ).fetchall()
         assessment["findings"] = [self._public_finding(item) for item in finding_rows]
@@ -582,6 +633,7 @@ class CareviewStore:
             "createdAt": row["created_at"],
             "createdBy": {"id": row["created_by"], "displayName": row["creator_name"]},
             "assessment": assessment,
+            "media": [self._public_media(item) for item in media_rows],
         }
 
     def create_scene(
@@ -590,6 +642,7 @@ class CareviewStore:
         patient_id: Any,
         metadata: Any,
         assessment: Any,
+        media: Any = None,
     ) -> dict[str, Any]:
         workspace_id, actor_id = self._validate_context(context)
         patient_id = self._validate_id(patient_id, "patient id")
@@ -608,6 +661,86 @@ class CareviewStore:
         findings = assessment.get("findings")
         if not isinstance(findings, list) or len(findings) > 6:
             raise StoreValidationError("Scene findings are invalid.")
+        if media is None:
+            media = []
+        if not isinstance(media, list) or len(media) not in {0, frames_submitted}:
+            raise StoreValidationError("Scene media metadata is invalid.")
+        validated_media: list[dict[str, Any]] = []
+        frame_numbers: set[int] = set()
+        for item in media:
+            if not isinstance(item, dict) or set(item) != {
+                "id",
+                "objectKey",
+                "mimeType",
+                "byteSize",
+                "sha256",
+                "width",
+                "height",
+                "frameNumber",
+                "timestampMs",
+            }:
+                raise StoreValidationError("Scene media metadata is invalid.")
+            media_id = self._validate_id(item["id"], "media id")
+            object_key = item["objectKey"]
+            checksum = item["sha256"]
+            mime_type_value = item["mimeType"]
+            byte_size = item["byteSize"]
+            width = item["width"]
+            height = item["height"]
+            frame_number = item["frameNumber"]
+            timestamp_ms = item["timestampMs"]
+            if not isinstance(object_key, str) or not MEDIA_OBJECT_KEY_RE.fullmatch(object_key):
+                raise StoreValidationError("Scene media object key is invalid.")
+            if not isinstance(checksum, str) or not SHA256_RE.fullmatch(checksum):
+                raise StoreValidationError("Scene media checksum is invalid.")
+            if mime_type_value not in ALLOWED_MEDIA_MIMES:
+                raise StoreValidationError("Scene media type is invalid.")
+            if (
+                not isinstance(byte_size, int)
+                or isinstance(byte_size, bool)
+                or not 1 <= byte_size <= 4 * 1024 * 1024
+            ):
+                raise StoreValidationError("Scene media byte size is invalid.")
+            if (
+                not isinstance(width, int)
+                or isinstance(width, bool)
+                or not 1 <= width <= 1280
+                or not isinstance(height, int)
+                or isinstance(height, bool)
+                or not 1 <= height <= 1280
+            ):
+                raise StoreValidationError("Scene media dimensions are invalid.")
+            if (
+                not isinstance(frame_number, int)
+                or isinstance(frame_number, bool)
+                or not 1 <= frame_number <= frames_submitted
+                or frame_number in frame_numbers
+            ):
+                raise StoreValidationError("Scene media frame number is invalid.")
+            if timestamp_ms is not None and (
+                not isinstance(timestamp_ms, int)
+                or isinstance(timestamp_ms, bool)
+                or not 0 <= timestamp_ms <= 30_000
+            ):
+                raise StoreValidationError("Scene media timestamp is invalid.")
+            if media_type == "image" and timestamp_ms is not None:
+                raise StoreValidationError("Still-image evidence cannot have a timestamp.")
+            if media_type == "video" and timestamp_ms is None:
+                raise StoreValidationError("Video-frame evidence requires a timestamp.")
+            frame_numbers.add(frame_number)
+            validated_media.append(
+                {
+                    "id": media_id,
+                    "objectKey": object_key,
+                    "mimeType": mime_type_value,
+                    "byteSize": byte_size,
+                    "sha256": checksum,
+                    "width": width,
+                    "height": height,
+                    "frameNumber": frame_number,
+                    "timestampMs": timestamp_ms,
+                }
+            )
         assessment_base = dict(assessment)
         assessment_base.pop("findings", None)
         # A defensive size ceiling prevents accidental storage of media-like payloads.
@@ -639,6 +772,30 @@ class CareviewStore:
                     timestamp,
                 ),
             )
+            for item in validated_media:
+                connection.execute(
+                    """INSERT INTO scene_media
+                       (id, workspace_id, patient_id, scene_id, object_key, mime_type,
+                        byte_size, sha256, width, height, frame_number, timestamp_ms,
+                        created_by, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        item["id"],
+                        workspace_id,
+                        patient_id,
+                        scene_id,
+                        item["objectKey"],
+                        item["mimeType"],
+                        item["byteSize"],
+                        item["sha256"],
+                        item["width"],
+                        item["height"],
+                        item["frameNumber"],
+                        item["timestampMs"],
+                        actor_id,
+                        timestamp,
+                    ),
+                )
             for finding in findings:
                 if not isinstance(finding, dict):
                     raise StoreValidationError("A derived finding is invalid.")
@@ -676,6 +833,41 @@ class CareviewStore:
                 (scene_id,),
             ).fetchone()
             return self._scene_from_row(connection, row)
+
+    def list_media_object_keys(self) -> set[str]:
+        """Return the opaque filesystem keys currently committed in SQLite."""
+        with self._connect() as connection:
+            rows = connection.execute("SELECT object_key FROM scene_media").fetchall()
+        keys = {row["object_key"] for row in rows}
+        if any(not MEDIA_OBJECT_KEY_RE.fullmatch(key) for key in keys):
+            raise StoreValidationError("Stored scene media metadata is invalid.")
+        return keys
+
+    def get_scene_media(
+        self,
+        context: Any,
+        patient_id: Any,
+        scene_id: Any,
+        media_id: Any,
+    ) -> dict[str, Any]:
+        """Return an authorized media record, including its server-only object key."""
+        workspace_id, _ = self._validate_context(context)
+        patient_id = self._validate_id(patient_id, "patient id")
+        scene_id = self._validate_id(scene_id, "scene id")
+        media_id = self._validate_id(media_id, "media id")
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT scene_media.*, users.display_name AS media_creator_name
+                   FROM scene_media JOIN users ON users.id = scene_media.created_by
+                   WHERE scene_media.id = ? AND scene_media.workspace_id = ?
+                     AND scene_media.patient_id = ? AND scene_media.scene_id = ?""",
+                (media_id, workspace_id, patient_id, scene_id),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("Scene media not found.")
+        result = self._public_media(row)
+        result["objectKey"] = row["object_key"]
+        return result
 
     def list_scenes(self, context: Any, patient_id: Any) -> list[dict[str, Any]]:
         workspace_id, _ = self._validate_context(context)
