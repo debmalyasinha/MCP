@@ -5,3 +5,7 @@ server-error.log
 careview-server.stdout.log
 careview-server.stderr.log
 .env
+data/
+*.db
+*.db-shm
+*.db-wal

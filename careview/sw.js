@@ -1,5 +1,5 @@
 const CACHE_PREFIX = "careview-";
-const CACHE_NAME = `${CACHE_PREFIX}v8`;
+const CACHE_NAME = `${CACHE_PREFIX}v9`;
 const APP_SHELL = [
   "./index.html",
   "./styles.css",
@@ -39,6 +39,7 @@ self.addEventListener("fetch", (event) => {
 
   const requestUrl = new URL(event.request.url);
   if (requestUrl.origin !== self.location.origin) return;
+  if (requestUrl.pathname.startsWith("/api/")) return;
 
   if (event.request.mode === "navigate") {
     event.respondWith(fetch(event.request).catch(() => caches.match(INDEX_URL)));

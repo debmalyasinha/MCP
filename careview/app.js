@@ -1,9 +1,13 @@
 (function () {
   "use strict";
 
-  const STORAGE_KEY = "careview-prototype-v1";
+  const PREFERENCES_KEY = "careview-ui-v2";
+  const LEGACY_STORAGE_KEY = "careview-prototype-v1";
   const app = document.querySelector("#app");
   const nav = document.querySelector(".bottom-nav");
+  const appHeader = document.querySelector("#app-header");
+  const userMenuButton = document.querySelector("#user-menu-button");
+  const userInitials = document.querySelector("#user-initials");
   const sheet = document.querySelector("#bottom-sheet");
   const sheetBackdrop = document.querySelector("#sheet-backdrop");
   const toast = document.querySelector("#toast");
@@ -36,19 +40,51 @@
     },
   };
 
-  const defaultState = {
+  const defaultPreferences = {
     settings: {
       redact: true,
       retain: false,
       caregiverUpdates: true,
       iosInstallDismissed: false,
     },
+  };
+
+  const preferences = loadPreferences();
+  let state = {
+    settings: preferences.settings,
     findings: [],
     scans: [],
   };
-
-  let state = loadState();
-  let currentRoute = "home";
+  let session = {
+    status: "loading",
+    authenticated: false,
+    setupRequired: false,
+    user: null,
+    csrfToken: "",
+    expiresAt: null,
+  };
+  let currentRoute = "patients";
+  let selectedPatient = null;
+  let patientDirectory = [];
+  let patientSuggestions = [];
+  let patientQuery = "";
+  let patientSearchOpen = false;
+  let patientActiveIndex = -1;
+  let patientDirectoryLoading = false;
+  let patientSearchLoading = false;
+  let patientSceneLoading = false;
+  let patientError = "";
+  let patientSearchController = null;
+  let patientSearchTimer = null;
+  let authBusy = false;
+  let authError = "";
+  let authDraft = { workspaceName: "", displayName: "", email: "" };
+  let patientMutationBusy = false;
+  let patientDraft = { displayName: "", careLocation: "" };
+  let staffUsers = [];
+  let staffLoading = false;
+  let staffError = "";
+  let staffDraft = { displayName: "", email: "" };
   let scanStep = 1;
   let selectedZone = null;
   let mediaPreview = "";
@@ -68,38 +104,97 @@
   let sheetReturnFocus = null;
   let analysisTimer = null;
   let analysisController = null;
+  let analysisPatientId = "";
   let analysisRunToken = 0;
   let analysisProgressMessage = "";
   let currentAnalysisSummary = null;
   let currentResultAggregate = false;
   let analysisConsentConfirmed = false;
   let toastTimer = null;
+  let sessionRevalidationPromise = null;
+  let sessionExpiryTimer = null;
 
   const ANALYSIS_TIMEOUT_MS = 90_000;
   const MAX_VIDEO_FRAMES = 6;
   const MAX_ANALYSIS_EDGE = 1280;
   const JPEG_QUALITY = 0.78;
 
-  function loadState() {
+  function loadPreferences() {
+    let saved = null;
+    localStorage.removeItem(LEGACY_STORAGE_KEY);
     try {
-      const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
-      if (!saved || !Array.isArray(saved.findings) || !Array.isArray(saved.scans)) return structuredClone(defaultState);
-      const legacySeedFindingIds = new Set(["baseline-spill", "baseline-food"]);
-      const legacySeedScanIds = new Set(["scan-1", "scan-2", "scan-3"]);
-      return {
-        ...structuredClone(defaultState),
-        ...saved,
-        findings: saved.findings.filter((finding) => !legacySeedFindingIds.has(finding?.id)),
-        scans: saved.scans.filter((scan) => !legacySeedScanIds.has(scan?.id)),
-        settings: { ...defaultState.settings, ...(saved.settings || {}) },
-      };
+      saved = JSON.parse(localStorage.getItem(PREFERENCES_KEY));
     } catch (_error) {
-      return structuredClone(defaultState);
+      saved = null;
     }
+    const loaded = {
+      settings: {
+        redact: typeof saved?.settings?.redact === "boolean" ? saved.settings.redact : defaultPreferences.settings.redact,
+        retain: typeof saved?.settings?.retain === "boolean" ? saved.settings.retain : defaultPreferences.settings.retain,
+        caregiverUpdates: typeof saved?.settings?.caregiverUpdates === "boolean" ? saved.settings.caregiverUpdates : defaultPreferences.settings.caregiverUpdates,
+        iosInstallDismissed: typeof saved?.settings?.iosInstallDismissed === "boolean" ? saved.settings.iosInstallDismissed : defaultPreferences.settings.iosInstallDismissed,
+      },
+    };
+    localStorage.setItem(PREFERENCES_KEY, JSON.stringify(loaded));
+    return loaded;
   }
 
-  function saveState() {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  function savePreferences() {
+    const safePreferences = {
+      settings: { ...state.settings },
+    };
+    localStorage.setItem(PREFERENCES_KEY, JSON.stringify(safePreferences));
+  }
+
+  function resetPatientData() {
+    state.findings = [];
+    state.scans = [];
+    selectedPatient = null;
+    currentFindings = [];
+    currentAnalysisSummary = null;
+    currentResultAggregate = false;
+    activeFindingId = null;
+  }
+
+  function clearSensitiveClientState() {
+    cancelActiveAnalysis();
+    clearMediaPreview();
+    clearTimeout(patientSearchTimer);
+    if (patientSearchController) patientSearchController.abort();
+    patientSearchController = null;
+    resetPatientData();
+    patientDirectory = [];
+    patientSuggestions = [];
+    patientQuery = "";
+    patientSearchOpen = false;
+    patientActiveIndex = -1;
+    staffUsers = [];
+    staffError = "";
+    patientDraft = { displayName: "", careLocation: "" };
+    staffDraft = { displayName: "", email: "" };
+  }
+
+  function clearSessionExpiryTimer() {
+    if (sessionExpiryTimer !== null) clearTimeout(sessionExpiryTimer);
+    sessionExpiryTimer = null;
+  }
+
+  function scheduleSessionExpiry(expiresAt) {
+    clearSessionExpiryTimer();
+    const epochSeconds = Number(expiresAt);
+    if (!Number.isFinite(epochSeconds) || epochSeconds <= 0) return;
+    const delay = Math.max(0, Math.min(epochSeconds * 1000 - Date.now(), 2_147_483_647));
+    sessionExpiryTimer = setTimeout(() => transitionToSignedOut(), delay);
+  }
+
+  function transitionToSignedOut({ setupRequired = false } = {}) {
+    clearSessionExpiryTimer();
+    clearSensitiveClientState();
+    authDraft = { workspaceName: "", displayName: "", email: "" };
+    session = { status: "ready", authenticated: false, setupRequired, user: null, csrfToken: "", expiresAt: null };
+    currentRoute = "patients";
+    window.history.replaceState({ route: "patients", scanStep: 0 }, "");
+    render();
   }
 
   function icon(name) {
@@ -127,6 +222,10 @@
       share: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15V3m-4 4 4-4 4 4"/><path d="M6 11H4v10h16V11h-2"/></svg>',
       trash: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16m-10-3h4l1 3M7 7l1 14h8l1-14M10 11v6m4-6v6"/></svg>',
       refresh: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 8a7 7 0 0 1 11.6-1.5L20 9M4 15l2.3 2.5A7 7 0 0 0 18 16"/></svg>',
+      search: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m16.5 16.5 4 4"/></svg>',
+      plus: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
+      logout: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 4H5v16h5m4-4 4-4-4-4m4 4H9"/></svg>',
+      user: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>',
     };
     return icons[name] || icons.info;
   }
@@ -140,16 +239,423 @@
     return window.matchMedia?.("(display-mode: standalone)")?.matches || navigator.standalone === true;
   }
 
+  function displayName(record, fallback = "Careview user") {
+    if (typeof record === "string" && record.trim()) return record.trim();
+    const value = record?.displayName ?? record?.display_name ?? record?.name;
+    return typeof value === "string" && value.trim() ? value.trim() : fallback;
+  }
+
+  function initialsFor(record) {
+    return displayName(record, "CV")
+      .split(/\s+/)
+      .slice(0, 2)
+      .map((part) => part[0] || "")
+      .join("")
+      .toUpperCase() || "CV";
+  }
+
+  function isAdminUser(user = session.user) {
+    return Boolean(user?.isAdmin || user?.is_admin || String(user?.role || "").toLowerCase() === "admin");
+  }
+
+  async function apiFetch(path, options = {}) {
+    const method = String(options.method || "GET").toUpperCase();
+    const headers = new Headers(options.headers || {});
+    headers.set("Accept", "application/json");
+    if (options.body != null && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+    if (!["GET", "HEAD"].includes(method) && session.csrfToken) headers.set("X-CSRF-Token", session.csrfToken);
+    const response = await fetch(path, {
+      ...options,
+      method,
+      headers,
+      credentials: "same-origin",
+      cache: "no-store",
+    });
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch (_error) {
+      payload = null;
+    }
+    if (response.ok && typeof payload?.csrfToken === "string") session.csrfToken = payload.csrfToken;
+    if (!response.ok) {
+      if (response.status === 401) {
+        transitionToSignedOut();
+      }
+      const error = new Error(payload?.error?.message || payload?.message || "Careview could not complete that request.");
+      error.status = response.status;
+      error.code = payload?.error?.code || payload?.code || "request_failed";
+      error.payload = payload;
+      throw error;
+    }
+    return payload || {};
+  }
+
+  function normalizeFinding(rawFinding, scene) {
+    const urgencyValue = String(rawFinding?.urgency || "soon").toLowerCase().replaceAll(" ", "_");
+    const urgency = ["now", "soon", "monitor"].includes(urgencyValue) ? urgencyValue : urgencyValue === "check_now" ? "now" : "soon";
+    const status = ["pending", "confirmed", "resolved", "dismissed"].includes(rawFinding?.status) ? rawFinding.status : "pending";
+    const frames = rawFinding?.evidenceFrameNumbers ?? rawFinding?.evidence_frame_numbers;
+    const evidenceSeconds = rawFinding?.evidenceTimestamps ?? rawFinding?.evidence_timestamps_seconds;
+    const evidenceMilliseconds = rawFinding?.evidenceTimestampsMs ?? rawFinding?.evidence_timestamps_ms;
+    const evidenceTimestamps = Array.isArray(evidenceSeconds)
+      ? evidenceSeconds
+      : Array.isArray(evidenceMilliseconds) ? evidenceMilliseconds.filter(Number.isFinite).map((value) => value / 1000) : [];
+    return {
+      id: String(rawFinding?.id || `${scene.id}-finding-${Math.random().toString(36).slice(2)}`),
+      scanId: String(scene.id || ""),
+      patientId: String(selectedPatient?.id || ""),
+      category: String(rawFinding?.category || "Cleanliness"),
+      title: String(rawFinding?.title || "Observation"),
+      observed: String(rawFinding?.observed ?? rawFinding?.visibleObservation ?? rawFinding?.visible_observation ?? "Review this visible condition in person."),
+      meaning: String(rawFinding?.meaning ?? rawFinding?.whyItMayMatter ?? rawFinding?.why_it_may_matter ?? "This visible condition may warrant review."),
+      action: String(rawFinding?.action ?? rawFinding?.caregiverCheck ?? rawFinding?.suggestedCaregiverCheck ?? rawFinding?.suggested_caregiver_check ?? "Check this condition in person."),
+      urgency,
+      urgencyLabel: String(rawFinding?.urgencyLabel ?? rawFinding?.urgency_label ?? (urgency === "now" ? "Check now" : urgency === "monitor" ? "Monitor" : "Review soon")),
+      confidence: null,
+      limitation: String(rawFinding?.limitation ?? rawFinding?.uncertainty ?? "The scene may be incomplete or unclear."),
+      status,
+      note: typeof rawFinding?.note === "string" ? rawFinding.note : "",
+      version: Number.isInteger(rawFinding?.version) ? rawFinding.version : 0,
+      updatedAt: rawFinding?.updatedAt ?? rawFinding?.updated_at ?? null,
+      reviewedBy: rawFinding?.reviewedBy ?? rawFinding?.reviewed_by ?? null,
+      zone: scene.zoneLabel,
+      timestamp: scene.timestamp,
+      mediaType: scene.mediaType,
+      durationSeconds: scene.durationSeconds,
+      framesSent: Number.isInteger(scene.framesSent) ? scene.framesSent : 0,
+      frameTimestamps: [...scene.frameTimestamps],
+      evidenceFrameNumbers: Array.isArray(frames) ? frames.filter(Number.isInteger).slice(0, MAX_VIDEO_FRAMES) : [],
+      evidenceTimestamps: Array.isArray(evidenceTimestamps) ? evidenceTimestamps.filter(Number.isFinite).slice(0, MAX_VIDEO_FRAMES) : [],
+      source: scene.source,
+      assessmentStatus: scene.assessmentStatus,
+      assessmentOutcome: scene.assessmentOutcome,
+      model: scene.model,
+      demoOutput: false,
+    };
+  }
+
+  function normalizeServerScene(rawScene) {
+    const rawAssessment = rawScene?.assessment && typeof rawScene.assessment === "object" ? rawScene.assessment : {};
+    const rawFindings = Array.isArray(rawAssessment.findings)
+      ? rawAssessment.findings
+      : Array.isArray(rawScene?.findings) ? rawScene.findings : [];
+    const zoneKey = String(rawScene?.zone || "");
+    const timestamp = rawScene?.createdAt ?? rawScene?.created_at ?? rawScene?.timestamp ?? null;
+    const coverage = rawAssessment?.analysisCoverage ?? rawAssessment?.analysis_coverage ?? {};
+    const rawFrameSeconds = rawAssessment?.frameTimestamps ?? rawAssessment?.frame_timestamps ?? rawScene?.frameTimestamps;
+    const rawFrameMilliseconds = coverage?.timestampsMs ?? coverage?.timestamps_ms;
+    const frameTimestamps = Array.isArray(rawFrameSeconds)
+      ? rawFrameSeconds
+      : Array.isArray(rawFrameMilliseconds) ? rawFrameMilliseconds.filter(Number.isFinite).map((value) => value / 1000) : [];
+    const scene = {
+      id: String(rawScene?.id || ""),
+      zone: zoneKey,
+      zoneLabel: String((rawScene?.zoneLabel ?? rawScene?.zone_label ?? zones[zoneKey]?.name ?? zoneKey) || "Scene"),
+      timestamp,
+      createdAt: timestamp,
+      createdBy: rawScene?.createdBy ?? rawScene?.created_by ?? null,
+      mediaType: String(rawScene?.mediaType ?? rawScene?.media_type ?? "image"),
+      durationSeconds: rawScene?.durationSeconds ?? rawScene?.duration_seconds ?? null,
+      source: "ai",
+      framesSent: Number.isInteger(rawAssessment?.framesSent ?? rawAssessment?.frames_sent ?? rawAssessment?.framesSubmitted ?? rawAssessment?.frames_submitted ?? rawScene?.framesSubmitted ?? rawScene?.frames_submitted)
+        ? rawAssessment.framesSent ?? rawAssessment.frames_sent ?? rawAssessment.framesSubmitted ?? rawAssessment.frames_submitted ?? rawScene.framesSubmitted ?? rawScene.frames_submitted
+        : Array.isArray(frameTimestamps) ? frameTimestamps.length : 0,
+      frameTimestamps: Array.isArray(frameTimestamps) ? frameTimestamps.filter(Number.isFinite).slice(0, MAX_VIDEO_FRAMES) : [],
+      assessmentStatus: rawAssessment?.assessmentStatus ?? rawAssessment?.assessment_status ?? rawAssessment?.status ?? "assessed",
+      assessmentOutcome: rawAssessment?.assessmentOutcome ?? rawAssessment?.assessment_outcome ?? null,
+      assessmentNote: rawAssessment?.assessmentNote ?? rawAssessment?.assessment_note ?? null,
+      unableToAssess: Boolean(rawAssessment?.unableToAssess ?? rawAssessment?.unable_to_assess),
+      model: rawAssessment?.model ?? null,
+      demoOutput: false,
+    };
+    scene.findings = rawFindings.map((finding) => normalizeFinding(finding, scene));
+    scene.count = scene.findings.length;
+    scene.type = scene.unableToAssess ? "unable" : scene.count ? "review" : "clear";
+    return scene;
+  }
+
+  function applyPatientScenes(rawScenes) {
+    const scenes = (Array.isArray(rawScenes) ? rawScenes : [])
+      .filter((scene) => scene && typeof scene === "object")
+      .map(normalizeServerScene)
+      .sort((left, right) => new Date(right.timestamp || 0) - new Date(left.timestamp || 0));
+    state.scans = scenes;
+    state.findings = scenes.flatMap((scene) => scene.findings);
+  }
+
+  async function loadPatientScenes(patient = selectedPatient, { quiet = false } = {}) {
+    if (!patient?.id || !session.authenticated) return;
+    const requestedId = String(patient.id);
+    patientSceneLoading = !quiet;
+    patientError = "";
+    if (!quiet) render();
+    try {
+      const payload = await apiFetch(`/api/patients/${encodeURIComponent(requestedId)}/scenes`);
+      if (String(selectedPatient?.id || "") !== requestedId) return;
+      if (payload.patient) selectedPatient = { ...selectedPatient, ...payload.patient };
+      const resultScanId = currentFindings[0]?.scanId;
+      applyPatientScenes(payload.scenes);
+      if (currentRoute === "results") {
+        if (currentResultAggregate) currentFindings = state.findings.filter((finding) => finding.status === "pending");
+        else if (resultScanId) {
+          const refreshedScene = state.scans.find((scene) => scene.id === resultScanId);
+          currentFindings = refreshedScene?.findings || [];
+          if (refreshedScene) currentAnalysisSummary = {
+            source: "ai",
+            mediaType: refreshedScene.mediaType,
+            durationSeconds: refreshedScene.durationSeconds,
+            framesSent: refreshedScene.framesSent,
+            frameTimestamps: [...refreshedScene.frameTimestamps],
+            unableToAssess: refreshedScene.unableToAssess,
+            assessmentNote: refreshedScene.assessmentNote,
+            assessmentStatus: refreshedScene.assessmentStatus,
+            assessmentOutcome: refreshedScene.assessmentOutcome,
+            model: refreshedScene.model,
+          };
+        }
+      }
+    } catch (error) {
+      if (String(selectedPatient?.id || "") !== requestedId) return;
+      patientError = error.status === 403 || error.status === 404
+        ? "You no longer have access to this patient."
+        : error.message;
+      if ([403, 404].includes(error.status)) resetPatientData();
+    } finally {
+      if (String(selectedPatient?.id || "") === requestedId || !selectedPatient) {
+        patientSceneLoading = false;
+        render();
+      }
+    }
+  }
+
+  async function selectPatient(patient, { route = "home" } = {}) {
+    if (!patient?.id) return;
+    clearTimeout(patientSearchTimer);
+    if (patientSearchController) patientSearchController.abort();
+    patientSearchController = null;
+    cancelActiveAnalysis();
+    clearMediaPreview();
+    resetPatientData();
+    selectedPatient = { ...patient };
+    patientQuery = "";
+    patientSearchOpen = false;
+    patientActiveIndex = -1;
+    patientSuggestions = [];
+    currentRoute = route;
+    window.history.pushState({ route, scanStep: 0 }, "");
+    await loadPatientScenes(selectedPatient);
+    window.scrollTo(0, 0);
+  }
+
+  function restorePatientSearchFocus() {
+    requestAnimationFrame(() => {
+      const input = document.querySelector("#patient-search");
+      if (!input) return;
+      input.focus({ preventScroll: true });
+      input.setSelectionRange(input.value.length, input.value.length);
+    });
+  }
+
+  async function loadPatientDirectory(query = "", { restoreSearchFocus = false } = {}) {
+    if (patientSearchController) patientSearchController.abort();
+    const controller = new AbortController();
+    patientSearchController = controller;
+    patientSearchLoading = true;
+    if (!query) patientDirectoryLoading = true;
+    patientError = "";
+    render();
+    if (restoreSearchFocus) restorePatientSearchFocus();
+    try {
+      const payload = await apiFetch(`/api/patients?q=${encodeURIComponent(query)}`, { signal: controller.signal });
+      if (controller !== patientSearchController) return;
+      const patients = Array.isArray(payload.patients) ? payload.patients : [];
+      patientSuggestions = patients;
+      if (!query) patientDirectory = patients;
+    } catch (error) {
+      if (error?.name !== "AbortError") patientError = error.message;
+    } finally {
+      if (controller === patientSearchController) {
+        patientSearchController = null;
+        patientSearchLoading = false;
+        patientDirectoryLoading = false;
+        render();
+        if (restoreSearchFocus) restorePatientSearchFocus();
+      }
+    }
+  }
+
+  async function bootstrapSession() {
+    session.status = "loading";
+    render();
+    try {
+      const payload = await apiFetch("/api/session");
+      session = {
+        status: "ready",
+        authenticated: payload.authenticated === true,
+        setupRequired: payload.setupRequired === true,
+        user: payload.user || null,
+        csrfToken: typeof payload.csrfToken === "string" ? payload.csrfToken : "",
+        expiresAt: Number.isFinite(Number(payload.expiresAt)) ? Number(payload.expiresAt) : null,
+      };
+      if (session.authenticated) {
+        scheduleSessionExpiry(session.expiresAt);
+        currentRoute = "patients";
+        await loadPatientDirectory("");
+      } else {
+        clearSessionExpiryTimer();
+        clearSensitiveClientState();
+      }
+    } catch (error) {
+      clearSessionExpiryTimer();
+      clearSensitiveClientState();
+      session = { status: "error", authenticated: false, setupRequired: false, user: null, csrfToken: "", expiresAt: null };
+      authError = error.message;
+    }
+    render();
+  }
+
+  function revalidateSession() {
+    if (sessionRevalidationPromise) return sessionRevalidationPromise;
+    sessionRevalidationPromise = (async () => {
+      try {
+        const payload = await apiFetch("/api/session");
+        if (payload.authenticated !== true) {
+          transitionToSignedOut({ setupRequired: payload.setupRequired === true });
+          return;
+        }
+
+        const previousUserId = String(session.user?.id || "");
+        const nextUser = payload.user || session.user || null;
+        const nextUserId = String(nextUser?.id || "");
+        const identityChanged = session.authenticated && previousUserId && nextUserId && previousUserId !== nextUserId;
+        const needsPatientPicker = !session.authenticated || identityChanged;
+        if (needsPatientPicker) clearSensitiveClientState();
+        session = {
+          status: "ready",
+          authenticated: true,
+          setupRequired: false,
+          user: nextUser,
+          csrfToken: typeof payload.csrfToken === "string" ? payload.csrfToken : session.csrfToken,
+          expiresAt: Number.isFinite(Number(payload.expiresAt)) ? Number(payload.expiresAt) : null,
+        };
+        scheduleSessionExpiry(session.expiresAt);
+
+        if (needsPatientPicker) {
+          currentRoute = "patients";
+          window.history.replaceState({ route: "patients", scanStep: 0 }, "");
+          await loadPatientDirectory("");
+        } else if (selectedPatient && ["home", "history", "care", "results"].includes(currentRoute)) {
+          await loadPatientScenes(selectedPatient, { quiet: true });
+        } else if (!selectedPatient) {
+          render();
+        }
+      } catch (error) {
+        if (error.status !== 401) showToast("Session check failed. You are still signed in.");
+      } finally {
+        sessionRevalidationPromise = null;
+      }
+    })();
+    return sessionRevalidationPromise;
+  }
+
+  function renderAuthScreen(mode) {
+    const setup = mode === "setup";
+    const loading = mode === "loading";
+    return `<div class="screen auth-screen">
+      <section class="auth-card" aria-labelledby="auth-title">
+        <div class="auth-brand"><span class="brand-mark">${icon("shield")}</span><strong>careview</strong></div>
+        ${loading
+          ? `<div class="loading-state" role="status"><span class="loading-spinner" aria-hidden="true"></span><div><h1 id="auth-title">Opening Careview</h1><p>Checking your secure session…</p></div></div>`
+          : `<p class="eyebrow">${setup ? "First-time setup" : "Healthcare access"}</p>
+             <h1 id="auth-title">${setup ? "Create the first administrator" : "Sign in to Careview"}</h1>
+             <p class="lead">${setup ? "Set up this private workspace. The first account can add healthcare staff and patients." : "Use your assigned healthcare account to access authorized patients."}</p>
+             <form class="auth-form" data-form="${setup ? "setup" : "login"}">
+               ${setup ? `<label class="field-label" for="workspace-name">Workspace name</label><input class="text-input" id="workspace-name" name="workspaceName" autocomplete="organization" minlength="2" maxlength="80" value="${escapeHtml(authDraft.workspaceName)}" required />
+                 <label class="field-label" for="setup-name">Your display name</label><input class="text-input" id="setup-name" name="displayName" autocomplete="name" minlength="2" maxlength="100" value="${escapeHtml(authDraft.displayName)}" required />` : ""}
+               <label class="field-label" for="auth-email">Email</label><input class="text-input" id="auth-email" name="email" type="email" inputmode="email" autocomplete="username" maxlength="254" value="${escapeHtml(authDraft.email)}" required />
+               <label class="field-label" for="auth-password">Password</label><input class="text-input" id="auth-password" name="password" type="password" autocomplete="${setup ? "new-password" : "current-password"}" minlength="${setup ? 14 : 1}" maxlength="200" required />
+               ${setup ? '<p class="field-help">Use 14–200 characters with uppercase, lowercase, a number, and a symbol.</p>' : ""}
+               <p class="form-error" role="alert" ${authError ? "" : "hidden"}>${escapeHtml(authError)}</p>
+               <button class="primary-button" type="submit" ${authBusy ? "disabled" : ""}>${authBusy ? "Please wait…" : setup ? "Create workspace" : "Sign in"}</button>
+             </form>`}
+      </section>
+      <p class="auth-privacy">Use Careview only over your organization’s secure HTTPS address. Access is limited to authorized staff.</p>
+    </div>`;
+  }
+
+  function renderPatientOption(patient, index, inListbox = false) {
+    const id = String(patient?.id || "");
+    const name = displayName(patient, "Unnamed patient");
+    const location = String(patient?.careLocation ?? patient?.care_location ?? "Care location not provided");
+    return `<button class="patient-option" ${inListbox ? `id="patient-option-${index}" role="option" aria-selected="false"` : ""} type="button" data-action="select-patient" data-patient-id="${escapeHtml(id)}">
+      <span class="person-avatar">${escapeHtml(initialsFor(patient))}</span><span class="patient-option-copy"><strong>${escapeHtml(name)}</strong><span>${escapeHtml(location)}</span></span><span class="setting-arrow" aria-hidden="true">›</span>
+    </button>`;
+  }
+
+  function renderPatients() {
+    const shownPatients = patientSearchOpen ? patientSuggestions : patientDirectory;
+    const statusText = patientSearchLoading ? "Searching patients…" : patientSearchOpen ? `${shownPatients.length} suggestion${shownPatients.length === 1 ? "" : "s"}` : `${shownPatients.length} authorized patient${shownPatients.length === 1 ? "" : "s"}`;
+    return `<div class="screen page-pad patients-screen">
+      <p class="eyebrow">Patient workspace</p><h1>Select a patient</h1>
+      <p class="lead">Search only returns patients your healthcare account is authorized to access.</p>
+      <div class="patient-search-wrap">
+        <label class="field-label" for="patient-search">Search by patient name</label>
+        <div class="search-input-wrap">${icon("search")}<input class="text-input" id="patient-search" type="search" role="combobox" autocomplete="off" maxlength="100" aria-autocomplete="list" aria-controls="patient-suggestions" aria-expanded="${patientSearchOpen}" aria-activedescendant="" placeholder="Start typing a name" value="${escapeHtml(patientQuery)}" /></div>
+        <div class="suggestion-list" id="patient-suggestions" role="listbox" ${patientSearchOpen ? "" : "hidden"}>
+          ${shownPatients.length ? shownPatients.map((patient, index) => renderPatientOption(patient, index, true)).join("") : `<div class="empty-suggestion" role="status">${patientSearchLoading ? "Searching…" : "No authorized patients match that name."}</div>`}
+        </div>
+        <p class="field-help" id="patient-search-status" role="status" aria-live="polite">${escapeHtml(statusText)}</p>
+      </div>
+      ${patientError ? `<p class="form-error" role="alert">${escapeHtml(patientError)}</p>` : ""}
+      <div class="section-heading patient-list-heading"><h2>Patients</h2><span class="muted small">Shared workspace</span></div>
+      <div class="patient-list">
+        ${patientDirectoryLoading ? '<div class="loading-row" role="status"><span class="loading-spinner"></span>Loading patients…</div>' : patientDirectory.length ? patientDirectory.map((patient, index) => renderPatientOption(patient, index)).join("") : '<div class="empty-state"><strong>No patients yet</strong><span>Add the first patient to begin a scene review.</span></div>'}
+      </div>
+      <details class="add-panel" ${patientMutationBusy || patientError || !patientDirectory.length ? "open" : ""}>
+        <summary>${icon("plus")} Add patient</summary>
+        <form class="stack-form" data-form="add-patient">
+          <label class="field-label" for="patient-name">Patient display name</label><input class="text-input" id="patient-name" name="displayName" autocomplete="off" minlength="2" maxlength="120" value="${escapeHtml(patientDraft.displayName)}" required />
+          <label class="field-label" for="care-location">Care location <span class="muted">(optional)</span></label><input class="text-input" id="care-location" name="careLocation" autocomplete="off" maxlength="120" placeholder="Home, residence, or unit" value="${escapeHtml(patientDraft.careLocation)}" />
+          <p class="form-error" role="alert" ${patientError ? "" : "hidden"}>${escapeHtml(patientError)}</p>
+          <button class="primary-button" type="submit" ${patientMutationBusy ? "disabled" : ""}>${patientMutationBusy ? "Adding…" : "Add and select patient"}</button>
+        </form>
+      </details>
+    </div>`;
+  }
+
+  function patientContext() {
+    if (!selectedPatient) return "";
+    return `<button class="patient-context" type="button" data-route="patients" aria-label="Switch patient. Current patient: ${escapeHtml(displayName(selectedPatient, "Patient"))}">
+      <span class="person-avatar">${escapeHtml(initialsFor(selectedPatient))}</span><span><small>Current patient</small><strong>${escapeHtml(displayName(selectedPatient, "Patient"))}</strong></span><span aria-hidden="true">Switch</span>
+    </button>`;
+  }
+
   function render() {
     closeSheet(false);
-    if (currentRoute === "home") app.innerHTML = renderHome();
-    if (currentRoute === "scan") app.innerHTML = renderScan();
-    if (currentRoute === "analyzing") app.innerHTML = renderAnalyzing();
-    if (currentRoute === "results") app.innerHTML = renderResults();
-    if (currentRoute === "history") app.innerHTML = renderHistory();
-    if (currentRoute === "care") app.innerHTML = renderCare();
+    const authenticated = session.status === "ready" && session.authenticated;
+    appShell.classList.toggle("auth-mode", !authenticated);
+    appHeader.hidden = !authenticated;
+    nav.hidden = !authenticated;
+    if (userMenuButton && session.user) userMenuButton.setAttribute("aria-label", `Open account settings for ${displayName(session.user)}`);
+    if (userInitials) userInitials.textContent = initialsFor(session.user);
 
-    const hideNav = ["scan", "analyzing", "results"].includes(currentRoute);
+    if (session.status === "loading") app.innerHTML = renderAuthScreen("loading");
+    else if (session.status === "error") app.innerHTML = renderAuthScreen("login");
+    else if (session.setupRequired && !session.authenticated) app.innerHTML = renderAuthScreen("setup");
+    else if (!session.authenticated) app.innerHTML = renderAuthScreen("login");
+    else {
+      if (!selectedPatient && ["home", "scan", "analyzing", "results", "history"].includes(currentRoute)) currentRoute = "patients";
+      if (currentRoute === "patients") app.innerHTML = renderPatients();
+      if (currentRoute === "home") app.innerHTML = renderHome();
+      if (currentRoute === "scan") app.innerHTML = renderScan();
+      if (currentRoute === "analyzing") app.innerHTML = renderAnalyzing();
+      if (currentRoute === "results") app.innerHTML = renderResults();
+      if (currentRoute === "history") app.innerHTML = renderHistory();
+      if (currentRoute === "care") app.innerHTML = renderCare();
+    }
+
+    const hideNav = !authenticated || ["scan", "analyzing", "results"].includes(currentRoute);
     nav.classList.toggle("hidden", hideNav);
     document.querySelectorAll(".nav-item").forEach((item) => {
       const active = item.dataset.route === currentRoute;
@@ -160,25 +666,28 @@
   }
 
   function renderHome() {
+    if (patientSceneLoading) return `<div class="screen page-pad">${patientContext()}<div class="loading-row" role="status"><span class="loading-spinner"></span>Loading shared patient history…</div></div>`;
     const pending = state.findings.filter((finding) => finding.status === "pending").length;
     const latest = state.scans[0] || { zone: "No area checked", count: 0, date: "Not started" };
     const foodPending = state.findings.filter((finding) => finding.status === "pending" && finding.category === "Food").length;
     const medicationPending = state.findings.filter((finding) => finding.status === "pending" && finding.category === "Medication").length;
     const homePending = state.findings.filter((finding) => finding.status === "pending" && finding.category === "Cleanliness").length;
-    const baselineCount = state.scans.filter((scan) => ["Kitchen", "Fridge & freezer"].includes(scan.zone)).length;
+    const baselineCount = state.scans.filter((scan) => ["Kitchen", "Fridge & freezer"].includes(scan.zoneLabel || scan.zone)).length;
     const showIosInstall = isIosDevice() && !isStandaloneMode() && !state.settings.iosInstallDismissed;
     return `
       <div class="screen">
         <section class="home-hero">
-          <p class="eyebrow">Monday, August 10</p>
-          <h1>Good morning, Sarah.</h1>
+          ${patientContext()}
+          ${patientError ? `<p class="form-error" role="alert">${escapeHtml(patientError)}</p>` : ""}
+          <p class="eyebrow">${escapeHtml(new Date().toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" }))}</p>
+          <h1>Welcome, ${escapeHtml(displayName(session.user, "caregiver"))}.</h1>
           <p class="lead">A calm check-in helps you notice small changes before they become bigger concerns.</p>
 
           <div class="care-summary">
             <div class="summary-top">
               <div class="person-lockup">
-                <span class="person-avatar">ME</span>
-                <div><strong>Margaret Ellis</strong><span>Your mother · Home</span></div>
+                <span class="person-avatar">${escapeHtml(initialsFor(selectedPatient))}</span>
+                <div><strong>${escapeHtml(displayName(selectedPatient, "Patient"))}</strong><span>${escapeHtml(String(selectedPatient?.careLocation ?? selectedPatient?.care_location ?? "Care location not provided"))}</span></div>
               </div>
               <span class="consent-chip">Sample profile · upload consent required</span>
             </div>
@@ -238,16 +747,16 @@
             <div class="activity-row">
               <span class="timeline-icon ${latest.count ? "clean-bg" : "food-bg"}">${icon(latest.count ? "cleanliness" : "check")}</span>
               <div class="activity-copy">
-                <h3>${latest.zone} reviewed</h3>
-                <p>${latest.zone === "No area checked" ? "Start a consented scene check to create local history" : latest.count ? `${latest.count} observations were recorded in this prototype` : "No observations were flagged in the demo review"}</p>
+                <h3>${escapeHtml(latest.zoneLabel || latest.zone)} reviewed</h3>
+                <p>${latest.zone === "No area checked" ? "Start a consented scene check to create shared history" : latest.count ? `${latest.count} observations were recorded for caregiver review` : "No observations were returned; verify the scene in person"}</p>
               </div>
               <span class="activity-time">${displayDate(latest)}</span>
             </div>
             <div class="activity-row">
               <span class="timeline-icon food-bg">${icon("trend")}</span>
               <div class="activity-copy">
-                <h3>${baselineCount >= 3 ? "Sample baseline available" : "Baseline needs more scenes"}</h3>
-                <p>${baselineCount} comparable demo kitchen and fridge check${baselineCount === 1 ? "" : "s"}</p>
+                <h3>${baselineCount >= 3 ? "More comparable scenes available" : "Baseline needs more scenes"}</h3>
+                <p>${baselineCount} shared kitchen and fridge check${baselineCount === 1 ? "" : "s"}</p>
               </div>
               <span class="activity-time">3 days</span>
             </div>
@@ -304,7 +813,7 @@
             )
             .join("")}
         </div>
-        <div class="privacy-note">${icon("shield")}<span>Only capture a space with Margaret's consent. Avoid faces, voices, screens, mail, financial documents, addresses, and prescription labels.</span></div>
+        <div class="privacy-note">${icon("shield")}<span>Only capture a space with ${escapeHtml(displayName(selectedPatient, "the patient"))}'s or an authorized representative's consent. Avoid faces, voices, screens, mail, financial documents, addresses, and prescription labels.</span></div>
         <div class="scan-footer">
           <button class="primary-button" type="button" data-action="scan-next" ${selectedZone ? "" : "disabled"}>Continue ${icon("arrow")}</button>
         </div>
@@ -412,7 +921,7 @@
         ${
           isRealAnalysis
             ? `<label class="check-item" for="analysis-consent"><input id="analysis-consent" type="checkbox" ${analysisConsentConfirmed ? "checked" : ""} /><div><strong>Consent and privacy confirmation</strong><span>I confirm this is ${window.isSecureContext ? "test media or the resident/authorized representative consented to this upload" : "non-sensitive test media; I will not upload real resident information over plain HTTP"}, and I reviewed it for faces, voices, labels, and other identifiers.</span></div></label>
-               <div class="demo-banner">${icon("sparkle")}<span><strong>${window.isSecureContext ? "AI-assisted review:" : "Plain HTTP test only:"}</strong> ${!window.isSecureContext ? "This connection is not encrypted; use only non-sensitive test media. " : ""}${mediaType === "video" ? "At most six resized, silent video stills" : "One resized JPEG"} will be sent to the configured OpenAI backend; raw video and audio stay local. Automated redaction is not active. API content may appear in provider abuse-monitoring logs for up to 30 days by default. Derived results persist in this browser's unencrypted localStorage until deleted. ${window.isSecureContext ? "Use only test or explicitly consented media" : "Use only non-sensitive test media"}, and verify every result in person.</span></div>`
+               <div class="demo-banner">${icon("sparkle")}<span><strong>${window.isSecureContext ? "AI-assisted review:" : "Plain HTTP test only:"}</strong> ${!window.isSecureContext ? "This connection is not encrypted; use only non-sensitive test media. " : ""}${mediaType === "video" ? "At most six resized, silent video stills" : "One resized JPEG"} will be sent to the configured backend; raw video and audio stay local. Automated redaction is not active. Derived results and caregiver reviews are saved to this patient's shared workspace. ${window.isSecureContext ? "Use only consented media" : "Use only non-sensitive test media"}, and verify every result in person.</span></div>`
             : `<div class="demo-banner">${icon("sparkle")}<span><strong>Prototype mode:</strong> this review returns representative sample observations. It is not running a real vision model on your image or video.</span></div>`
         }
         <p class="media-error" id="analysis-error" role="alert" ${mediaError ? "" : "hidden"}>${escapeHtml(mediaError)}</p>
@@ -457,7 +966,7 @@
           title: "Counter has more items than baseline",
           observed: "Seven loose items are visible in the main food-preparation area; recent checks showed two to four.",
           meaning: "The usable preparation area may be reduced. This is a visual comparison, not a judgment about housekeeping.",
-          action: "Ask whether Margaret would like help clearing the food-preparation area.",
+          action: "Ask whether the patient would like help clearing the food-preparation area.",
           urgency: "soon",
           urgencyLabel: "Review soon",
           confidence: null,
@@ -505,7 +1014,7 @@
           title: "Organizer differs from configured visual plan",
           observed: "The Tuesday evening compartment appears full in the representative scene; the configured review plan marks it for a visual check.",
           meaning: "This is an organizer-state observation only. It does not prove whether medicine was taken.",
-          action: "Confirm the compartment and schedule with Margaret. Do not change a dose without a clinician or pharmacist.",
+          action: "Confirm the compartment and schedule with the patient. Do not change a dose without a clinician or pharmacist.",
           urgency: "soon",
           urgencyLabel: "Review soon",
           confidence: null,
@@ -518,7 +1027,7 @@
           title: "Main walking path appears narrowed",
           observed: "A laundry basket and two loose objects extend into the visible path between the chair and doorway.",
           meaning: "Objects in a common route may increase trip risk, especially when lighting is low.",
-          action: "Check the route in person and move objects if Margaret agrees.",
+          action: "Check the route in person and move objects if the patient agrees.",
           urgency: "now",
           urgencyLabel: "Check now",
           confidence: null,
@@ -814,110 +1323,55 @@
 
   async function requestAiAnalysis(preparedMedia, signal, runToken) {
     ensureActiveAnalysis(runToken, signal);
+    const patientId = analysisPatientId;
+    if (!patientId || patientId !== String(selectedPatient?.id || "")) throw new DOMException("Analysis cancelled", "AbortError");
     setAnalysisProgress(`Sending ${preparedMedia.frames.length} ${preparedMedia.frames.length === 1 ? "resized JPEG" : "silent JPEG stills"} to the configured AI service`, runToken);
-    const response = await fetch("/api/analyze", {
+    let payload;
+    try {
+      payload = await apiFetch(`/api/patients/${encodeURIComponent(patientId)}/analyze`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
       signal,
-      credentials: "same-origin",
-      cache: "no-store",
       body: JSON.stringify({
         zone: selectedZone,
         mediaType,
         frames: preparedMedia.frames,
       }),
-    });
-    ensureActiveAnalysis(runToken, signal);
-    if (!response.ok) {
-      if (response.status === 404 || response.status === 405) throw new Error("AI service is not available at this address. Start or deploy the Careview server with /api/analyze, then try again.");
-      if (response.status === 400 || response.status === 415) throw new Error("AI service rejected the prepared scene. Choose different media and try again.");
-      if (response.status === 413) throw new Error("AI service rejected this scene because the prepared images were too large.");
-      if (response.status === 429) throw new Error("AI service is busy or its usage limit was reached. Please try again later.");
-      if (response.status === 503) throw new Error("AI service is not configured on this server. Add the server API key and try again.");
-      if (response.status === 504) throw new Error("AI service timed out. Your source media remains available for another try.");
-      throw new Error("AI service could not analyze this scene. Please try again.");
+      });
+    } catch (error) {
+      if (error.status === 400 || error.status === 415) throw new Error("AI service rejected the prepared scene. Choose different media and try again.");
+      if (error.status === 413) throw new Error("AI service rejected this scene because the prepared images were too large.");
+      if (error.status === 429) throw new Error("AI service is busy or its usage limit was reached. Please try again later.");
+      if (error.status === 503) throw new Error("AI service is not configured on this server. Ask an administrator to check the server configuration.");
+      if (error.status === 504) throw new Error("AI service timed out. Your source media remains available for another try.");
+      throw error;
     }
+    ensureActiveAnalysis(runToken, signal);
+    if (patientId !== String(selectedPatient?.id || "")) throw new DOMException("Analysis cancelled", "AbortError");
     setAnalysisProgress("Validating the AI response before showing it", runToken);
-    let payload;
-    try {
-      payload = await response.json();
-    } catch (_error) {
-      throw new Error("AI service returned an invalid response.");
-    }
-    ensureActiveAnalysis(runToken, signal);
-    return normalizeAiResponse(payload, preparedMedia);
+    const rawScene = payload?.scene ?? payload;
+    if (!rawScene || typeof rawScene !== "object" || !rawScene.id || !rawScene.assessment) throw new Error("AI service returned an invalid saved scene.");
+    return normalizeServerScene(rawScene);
   }
 
-  function completeRealAnalysis(result, preparedMedia, runToken) {
+  function completeRealAnalysis(scene, preparedMedia, runToken) {
     if (runToken !== analysisRunToken || currentRoute !== "analyzing") return;
-    const timestamp = new Date().toISOString();
-    const scanId = `scan-${Date.now()}`;
-    const selectedMediaType = mediaType;
-    const durationSeconds = selectedMediaType === "video" ? mediaMeta?.duration || null : null;
-    const frameTimestamps = preparedMedia.frameTimestamps;
-    const analysisCoverage = {
-      framesSent: preparedMedia.frames.length,
-      timestampsSeconds: [...frameTimestamps],
-      audioAnalyzed: false,
-    };
-    currentFindings = result.findings.map((finding, index) => ({
-      ...finding,
-      id: `finding-${Date.now()}-${index}`,
-      status: "pending",
-      note: "",
-      zone: zones[selectedZone].name,
-      date: "Just now",
-      scanId,
-      timestamp,
-      mediaType: selectedMediaType,
-      durationSeconds,
-      framesSent: preparedMedia.frames.length,
-      frameTimestamps: [...frameTimestamps],
-      analysisCoverage: { ...analysisCoverage, timestampsSeconds: [...frameTimestamps] },
-      source: "ai",
-      assessmentStatus: result.assessmentStatus,
-      assessmentOutcome: result.assessmentOutcome,
-      model: result.model,
-      demoOutput: false,
-    }));
+    if (analysisPatientId !== String(selectedPatient?.id || "")) return;
+    currentFindings = scene.findings;
     currentAnalysisSummary = {
       source: "ai",
-      mediaType: selectedMediaType,
-      durationSeconds,
-      framesSent: preparedMedia.frames.length,
-      frameTimestamps: [...frameTimestamps],
-      analysisCoverage: { ...analysisCoverage, timestampsSeconds: [...frameTimestamps] },
-      unableToAssess: result.unableToAssess,
-      assessmentNote: result.assessmentNote,
-      assessmentStatus: result.assessmentStatus,
-      assessmentOutcome: result.assessmentOutcome,
-      model: result.model,
+      mediaType: scene.mediaType,
+      durationSeconds: scene.durationSeconds,
+      framesSent: scene.framesSent || preparedMedia.frames.length,
+      frameTimestamps: scene.frameTimestamps.length ? [...scene.frameTimestamps] : [...preparedMedia.frameTimestamps],
+      unableToAssess: scene.unableToAssess,
+      assessmentNote: scene.assessmentNote,
+      assessmentStatus: scene.assessmentStatus,
+      assessmentOutcome: scene.assessmentOutcome,
+      model: scene.model,
     };
     currentResultAggregate = false;
-    state.findings = [...currentFindings, ...state.findings];
-    state.scans = [
-      {
-        id: scanId,
-        zone: zones[selectedZone].name,
-        timestamp,
-        count: currentFindings.length,
-        type: result.unableToAssess ? "unable" : currentFindings.length ? "review" : "clear",
-        mediaType: selectedMediaType,
-        durationSeconds,
-        framesSent: preparedMedia.frames.length,
-        frameTimestamps: [...frameTimestamps],
-        analysisCoverage: { ...analysisCoverage, timestampsSeconds: [...frameTimestamps] },
-        source: "ai",
-        assessmentStatus: result.assessmentStatus,
-        assessmentOutcome: result.assessmentOutcome,
-        assessmentNote: result.assessmentNote,
-        model: result.model,
-        unableToAssess: result.unableToAssess,
-        demoOutput: false,
-      },
-      ...state.scans,
-    ].slice(0, 12);
-    saveState();
+    state.scans = [scene, ...state.scans.filter((item) => item.id !== scene.id)];
+    state.findings = state.scans.flatMap((item) => item.findings || []);
     activeFilter = "All";
     mediaError = "";
     analysisController = null;
@@ -957,24 +1411,8 @@
       model: null,
     };
     currentResultAggregate = false;
-    state.findings = [...currentFindings, ...state.findings];
-    state.scans = [
-      {
-        id: scanId,
-        zone: zones[selectedZone].name,
-        timestamp,
-        count: currentFindings.length,
-        type: "review",
-        mediaType: selectedMediaType,
-        durationSeconds,
-        framesSampled: 0,
-        plannedFrameCount,
-        source: "demo",
-        demoOutput: true,
-      },
-      ...state.scans,
-    ].slice(0, 12);
-    saveState();
+    // Demo observations are intentionally ephemeral and are never added to the
+    // selected patient's shared record.
     if (!state.settings.retain) clearMediaPreview();
     activeFilter = "All";
     currentRoute = "results";
@@ -1069,9 +1507,10 @@
       : isAiScan
         ? count ? `${count} AI-assisted observation${count === 1 ? "" : "s"} recorded · human review required` : "No AI observations returned · verify in person"
         : count ? `${count} prototype observation${count === 1 ? "" : "s"} recorded` : "no observations flagged";
+    const reviewer = scan.createdBy ? ` · Added by ${displayName(scan.createdBy, "healthcare staff")}` : "";
     return `<div class="activity-row">
       <span class="timeline-icon ${count ? "clean-bg" : "food-bg"}">${icon(count ? "trend" : "check")}</span>
-      <div class="activity-copy"><h3>${escapeHtml(scan.zone || "Scene")}</h3><p>${escapeHtml(mediaDescription + coverage)} · ${escapeHtml(outcome)}<br>${escapeHtml(displayDate(scan))}</p></div>
+      <div class="activity-copy"><h3>${escapeHtml(scan.zoneLabel || scan.zone || "Scene")}</h3><p>${escapeHtml(mediaDescription + coverage)} · ${escapeHtml(outcome)}<br>${escapeHtml(displayDate(scan) + reviewer)}</p></div>
     </div>`;
   }
 
@@ -1079,7 +1518,8 @@
     const pending = state.findings.filter((finding) => finding.status === "pending").length;
     return `
       <div class="screen page-pad">
-        <p class="eyebrow">Margaret's visual baseline</p>
+        ${patientContext()}
+        <p class="eyebrow">${escapeHtml(displayName(selectedPatient, "Patient"))}'s visual baseline</p>
         <h1>Changes over time</h1>
         <p class="lead">Patterns become more useful as comparable scenes are reviewed. One image or video still counts as one scene check, not a habit.</p>
 
@@ -1103,25 +1543,28 @@
           ${state.scans
             .slice(0, 8)
             .map(renderHistoryScan)
-            .join("") || '<div class="empty-state"><strong>No scene checks yet</strong><span>Start a consented check to create local prototype history.</span></div>'}
+            .join("") || '<div class="empty-state"><strong>No scene checks yet</strong><span>Start a consented check to create shared patient history.</span></div>'}
         </div>
       </div>`;
   }
 
   function renderCare() {
     const installStatus = isStandaloneMode() ? "Running from the Home Screen" : "Open the Safari installation guide";
+    const accountName = displayName(session.user);
+    const accountEmail = typeof session.user?.email === "string" ? session.user.email : "Healthcare account";
     return `
       <div class="screen page-pad">
-        <p class="eyebrow">Care circle</p>
-        <h1>Margaret's care</h1>
-        <p class="lead">Manage consent, privacy, and how this prototype handles scene information.</p>
+        ${selectedPatient ? patientContext() : ""}
+        <p class="eyebrow">Account & care</p>
+        <h1>${selectedPatient ? `${escapeHtml(displayName(selectedPatient, "Patient"))}'s care` : "Careview account"}</h1>
+        <p class="lead">Review the active patient, workspace access, privacy preferences, and your signed-in account.</p>
 
         <article class="profile-card">
           <div class="person-lockup">
-            <span class="person-avatar">ME</span>
-            <div><strong>Margaret Ellis</strong><span>Primary residence · Since July 2026</span></div>
+            <span class="person-avatar">${escapeHtml(initialsFor(session.user))}</span>
+            <div><strong>${escapeHtml(accountName)}</strong><span>${escapeHtml(accountEmail)} · ${escapeHtml(String(session.user?.role || "healthcare user").replaceAll("_", " "))}</span></div>
           </div>
-          <div class="profile-consent"><div><strong>Sample profile record only</strong><span>Not legal consent and not valid for AI uploads</span></div><span class="verified-badge">Demo</span></div>
+          ${selectedPatient ? `<div class="profile-consent"><div><strong>${escapeHtml(displayName(selectedPatient, "Patient"))}</strong><span>${escapeHtml(String(selectedPatient?.careLocation ?? selectedPatient?.care_location ?? "Care location not provided"))}</span></div><button class="quiet-button" type="button" data-route="patients">Switch</button></div>` : '<div class="profile-consent"><div><strong>No patient selected</strong><span>Select a patient before starting a scene check.</span></div><button class="quiet-button" type="button" data-route="patients">Select</button></div>'}
         </article>
 
         <div class="section-heading"><h2>Privacy controls</h2></div>
@@ -1134,15 +1577,36 @@
         <div class="section-heading"><h2>Access & data</h2></div>
         <div class="setting-group">
           <button class="setting-row" type="button" data-action="show-ios-install"><span class="setting-icon">${icon("share")}</span><span class="setting-copy"><strong>Install on iPhone</strong><span>${installStatus}</span></span><span class="setting-arrow">›</span></button>
-          <button class="setting-row" type="button" data-action="not-yet"><span class="setting-icon">${icon("users")}</span><span class="setting-copy"><strong>Care team access</strong><span>Sarah is the only prototype reviewer</span></span><span class="setting-arrow">›</span></button>
-          <button class="setting-row" type="button" data-action="export"><span class="setting-icon">${icon("download")}</span><span class="setting-copy"><strong>Export review history</strong><span>Download this device's prototype data</span></span><span class="setting-arrow">›</span></button>
-          <button class="setting-row" type="button" data-action="clear-local"><span class="setting-icon safety-bg">${icon("trash")}</span><span class="setting-copy"><strong>Delete local prototype data</strong><span>Remove findings, scans, notes, and any current preview</span></span><span class="setting-arrow">›</span></button>
+          ${selectedPatient ? `<button class="setting-row" type="button" data-action="export"><span class="setting-icon">${icon("download")}</span><span class="setting-copy"><strong>Export current patient history</strong><span>Download the records currently visible to your account</span></span><span class="setting-arrow">›</span></button>` : ""}
+          <button class="setting-row" type="button" data-action="clear-local"><span class="setting-icon safety-bg">${icon("trash")}</span><span class="setting-copy"><strong>Reset this device's preferences</strong><span>Clear UI preferences and the temporary media preview; shared records remain</span></span><span class="setting-arrow">›</span></button>
+          <button class="setting-row" type="button" data-action="logout"><span class="setting-icon">${icon("logout")}</span><span class="setting-copy"><strong>Sign out</strong><span>End this healthcare session on this device</span></span><span class="setting-arrow">›</span></button>
         </div>
 
+        ${isAdminUser() ? renderStaffAdministration() : ""}
+
         <div class="context-note" style="margin:0 0 18px">
-          ${icon("shield")}<span>AI analysis uploads a resized photo or up to six silent video stills; raw video and audio stay local. Derived results are stored in unencrypted browser localStorage. This prototype is not emergency monitoring and does not meet production healthcare-data requirements.</span>
+          ${icon("shield")}<span>AI analysis uploads a resized photo or up to six silent video stills; raw video and audio stay local. Patient scenes and caregiver reviews are stored in the authenticated shared workspace, never in browser storage. Careview is not emergency monitoring.</span>
         </div>
       </div>`;
+  }
+
+  function renderStaffAdministration() {
+    return `<section class="admin-panel" aria-labelledby="staff-title">
+      <div class="section-heading"><h2 id="staff-title">Healthcare staff</h2><button class="section-link" type="button" data-action="refresh-users">Refresh</button></div>
+      <div class="staff-list">
+        ${staffLoading ? '<div class="loading-row" role="status"><span class="loading-spinner"></span>Loading staff…</div>' : staffUsers.length ? staffUsers.map((user) => `<div class="staff-row"><span class="person-avatar">${escapeHtml(initialsFor(user))}</span><span><strong>${escapeHtml(displayName(user))}</strong><small>${escapeHtml(String(user?.email || ""))} · ${escapeHtml(String(user?.role || "healthcare user").replaceAll("_", " "))}</small></span></div>`).join("") : '<div class="empty-state"><strong>No staff list loaded</strong><span>Refresh to view workspace users.</span></div>'}
+      </div>
+      <details class="add-panel" ${staffError || staffLoading ? "open" : ""}><summary>${icon("plus")} Add healthcare user</summary>
+        <form class="stack-form" data-form="add-user">
+          <label class="field-label" for="staff-name">Display name</label><input class="text-input" id="staff-name" name="displayName" autocomplete="off" minlength="2" maxlength="100" value="${escapeHtml(staffDraft.displayName)}" required />
+          <label class="field-label" for="staff-email">Email</label><input class="text-input" id="staff-email" name="email" type="email" autocomplete="off" maxlength="254" value="${escapeHtml(staffDraft.email)}" required />
+          <label class="field-label" for="staff-password">Temporary password</label><input class="text-input" id="staff-password" name="password" type="password" autocomplete="new-password" minlength="14" maxlength="200" required />
+          <p class="field-help">Use 14–200 characters with uppercase, lowercase, a number, and a symbol.</p>
+          <p class="form-error" role="alert" ${staffError ? "" : "hidden"}>${escapeHtml(staffError)}</p>
+          <button class="primary-button" type="submit" ${staffLoading ? "disabled" : ""}>Add healthcare user</button>
+        </form>
+      </details>
+    </section>`;
   }
 
   function toggleRow(key, iconName, title, description, value) {
@@ -1152,6 +1616,8 @@
   }
 
   function goTo(route, addHistory = true) {
+    if (!session.authenticated) return;
+    if (!selectedPatient && ["home", "scan", "analyzing", "results", "history"].includes(route)) route = "patients";
     if (analysisTimer || analysisController) cancelActiveAnalysis();
     const leavingCapture = currentRoute === "scan" && route !== "scan";
     const leavingInFlightCheck = currentRoute === "analyzing" && !["scan", "results"].includes(route);
@@ -1161,11 +1627,18 @@
     currentRoute = route;
     if (addHistory) window.history.pushState({ route, scanStep: route === "scan" ? scanStep : 0 }, "");
     render();
+    if (route === "history" && selectedPatient) loadPatientScenes(selectedPatient, { quiet: true });
+    if (route === "care" && isAdminUser() && !staffUsers.length) loadStaffUsers();
     window.scrollTo({ top: 0, behavior: "smooth" });
     setTimeout(() => app.focus({ preventScroll: true }), 0);
   }
 
   function startScan() {
+    if (!selectedPatient?.id) {
+      goTo("patients");
+      showToast("Select a patient before starting a scene check");
+      return;
+    }
     selectedZone = null;
     scanStep = 1;
     currentFindings = [];
@@ -1239,6 +1712,7 @@
     analysisRunToken += 1;
     if (analysisController) analysisController.abort();
     analysisController = null;
+    analysisPatientId = "";
     analysisProgressMessage = "";
   }
 
@@ -1291,6 +1765,11 @@
       render();
       return;
     }
+    if (!selectedPatient?.id) {
+      mediaError = "Select a patient before starting AI analysis.";
+      goTo("patients");
+      return;
+    }
     if (!analysisConsentConfirmed) {
       mediaError = "Confirm consent and the privacy review before uploading media for AI analysis.";
       render();
@@ -1299,6 +1778,7 @@
     analysisConsentConfirmed = false;
     cancelActiveAnalysis();
     const runToken = analysisRunToken;
+    analysisPatientId = String(selectedPatient.id);
     const controller = new AbortController();
     analysisController = controller;
     analysisProgressMessage = mediaType === "video" ? "Preparing silent video frames on this device" : "Preparing a resized image on this device";
@@ -1335,11 +1815,12 @@
       clearTimeout(timeout);
       if (preparedMedia) preparedMedia.frames.forEach((frame) => { frame.dataUrl = ""; });
       if (analysisController === controller) analysisController = null;
+      if (runToken === analysisRunToken) analysisPatientId = "";
     }
   }
 
   function openFinding(id) {
-    const finding = state.findings.find((item) => item.id === id);
+    const finding = state.findings.find((item) => item.id === id) || currentFindings.find((item) => item.id === id);
     if (!finding) return;
     activeFindingId = id;
     reviewDraftStatus = ["pending", "confirmed", "resolved", "dismissed"].includes(finding.status) ? finding.status : "pending";
@@ -1373,6 +1854,7 @@
       <div class="detail-section"><strong>Uncertainty</strong><p>${escapeHtml(finding.limitation)}</p></div>
       <label class="note-label" for="caregiver-note">Caregiver note</label>
       <textarea class="note-input" id="caregiver-note" placeholder="Add what you verified in person…">${escapeHtml(finding.note || "")}</textarea>
+      ${finding.reviewedBy ? `<p class="small muted">Last reviewed by ${escapeHtml(displayName(finding.reviewedBy, "healthcare staff"))}${finding.updatedAt ? ` · ${escapeHtml(displayDate({ timestamp: finding.updatedAt }))}` : ""}</p>` : ""}
       <p class="small muted">Use Confirm only after checking the source preview or verifying the condition in person. A saved AI card without source media is not sufficient evidence.</p>
       <div class="review-actions" role="group" aria-label="Review status">
         <button class="review-action ${finding.status === "confirmed" ? "active" : ""}" type="button" data-action="set-review" data-status="confirmed" aria-pressed="${finding.status === "confirmed"}">Confirm in person</button>
@@ -1442,23 +1924,94 @@
     requestAnimationFrame(() => document.querySelector(selector)?.focus({ preventScroll: true }));
   }
 
+  async function loadStaffUsers() {
+    if (!isAdminUser() || staffLoading) return;
+    staffLoading = true;
+    staffError = "";
+    render();
+    try {
+      const payload = await apiFetch("/api/users");
+      staffUsers = Array.isArray(payload.users) ? payload.users : [];
+    } catch (error) {
+      staffError = error.message;
+    } finally {
+      staffLoading = false;
+      render();
+    }
+  }
+
+  async function signOut() {
+    try {
+      await apiFetch("/api/logout", { method: "POST", body: JSON.stringify({}) });
+    } catch (error) {
+      if (error.status !== 401) showToast("Sign-out failed. You are still signed in.");
+      return;
+    }
+    transitionToSignedOut();
+  }
+
+  async function saveFindingReview() {
+    const finding = state.findings.find((item) => item.id === activeFindingId) || currentFindings.find((item) => item.id === activeFindingId);
+    if (!finding) return;
+    const note = sheet.querySelector("#caregiver-note")?.value.trim() || "";
+    const previousStatus = finding.status;
+    const previousNote = finding.note;
+    if (finding.source === "demo") {
+      finding.status = reviewDraftStatus;
+      finding.note = note;
+      closeSheet(false);
+      render();
+      showToast("Demo review updated for this screen only");
+      return;
+    }
+    if (!selectedPatient?.id) return;
+    const saveButton = sheet.querySelector('[data-action="save-review"]');
+    if (saveButton) saveButton.disabled = true;
+    try {
+      const payload = await apiFetch(`/api/patients/${encodeURIComponent(selectedPatient.id)}/findings/${encodeURIComponent(finding.id)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ status: reviewDraftStatus, note, version: Number.isInteger(finding.version) ? finding.version : 0 }),
+      });
+      const saved = payload.finding ?? payload;
+      finding.status = ["pending", "confirmed", "resolved", "dismissed"].includes(saved?.status) ? saved.status : reviewDraftStatus;
+      finding.note = typeof saved?.note === "string" ? saved.note : note;
+      finding.version = Number.isInteger(saved?.version) ? saved.version : finding.version + 1;
+      finding.updatedAt = saved?.updatedAt ?? saved?.updated_at ?? finding.updatedAt;
+      finding.reviewedBy = saved?.reviewedBy ?? saved?.reviewed_by ?? finding.reviewedBy;
+      closeSheet(false);
+      if (currentRoute === "results") render();
+      showToast("Review saved to the shared patient record");
+    } catch (error) {
+      finding.status = previousStatus;
+      finding.note = previousNote;
+      if (error.status === 409) {
+        closeSheet(false);
+        await loadPatientScenes(selectedPatient, { quiet: true });
+        showToast("Another healthcare user updated this finding. The latest record is now shown.");
+      } else {
+        if (saveButton) saveButton.disabled = false;
+        showToast(error.message);
+      }
+    }
+  }
+
   function exportData() {
+    if (!selectedPatient) return;
     const payload = {
       exportedAt: new Date().toISOString(),
-      notice: "Prototype data. Findings require caregiver verification.",
-      profile: "Margaret Ellis",
+      notice: "Authorized patient export. AI findings require caregiver verification.",
+      patient: selectedPatient,
       scans: state.scans,
       findings: state.findings,
-      settings: state.settings,
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = "careview-prototype-export.json";
+    link.download = "careview-patient-history.json";
     link.click();
     URL.revokeObjectURL(url);
-    showToast("Prototype history exported");
+    showToast("Current patient history exported");
   }
 
   function displayDate(record) {
@@ -1493,6 +2046,11 @@
     if (!control) return;
     const action = control.dataset.action;
 
+    if (action === "select-patient") {
+      const id = String(control.dataset.patientId || "");
+      const patient = [...patientSuggestions, ...patientDirectory].find((item) => String(item?.id || "") === id);
+      if (patient) selectPatient(patient);
+    }
     if (action === "start-scan") startScan();
     if (action === "review-pending") reviewPending();
     if (action === "scan-back") handleBack();
@@ -1524,7 +2082,7 @@
     if (action === "show-ios-install") openIosInstallGuide();
     if (action === "dismiss-ios-install") {
       state.settings.iosInstallDismissed = true;
-      saveState();
+      savePreferences();
       render();
       showToast("iPhone install tip hidden — it remains available under Care");
     }
@@ -1545,38 +2103,169 @@
         video.focus();
       }
     }
-    if (action === "save-review") {
-      const finding = state.findings.find((item) => item.id === activeFindingId);
-      if (!finding) return;
-      finding.status = reviewDraftStatus;
-      finding.note = sheet.querySelector("#caregiver-note").value.trim();
-      saveState();
-      closeSheet(false);
-      if (currentRoute === "results") render();
-      showToast("Review saved");
-    }
+    if (action === "save-review") saveFindingReview();
     if (action === "toggle-setting") {
       const key = control.dataset.setting;
       state.settings[key] = !state.settings[key];
-      saveState();
+      savePreferences();
       renderAndFocus(`[data-setting="${key}"]`);
       showToast(`${control.querySelector("strong").textContent} ${state.settings[key] ? "on" : "off"}`);
     }
     if (action === "export") exportData();
-    if (action === "not-yet") showToast("Care-team invitations are a production feature");
+    if (action === "logout") signOut();
+    if (action === "refresh-users") loadStaffUsers();
     if (action === "clear-local") {
-      if (window.confirm("Delete all Careview prototype findings, scans, notes, and the current media preview from this device?")) {
+      if (window.confirm("Reset Careview UI preferences and remove the temporary media preview from this device? Shared patient records will not be deleted.")) {
         clearMediaPreview();
-        state = { settings: { ...defaultState.settings }, findings: [], scans: [] };
-        currentFindings = [];
-        currentAnalysisSummary = null;
-        currentResultAggregate = false;
-        activeFindingId = null;
-        saveState();
+        state.settings = { ...defaultPreferences.settings };
+        preferences.settings = state.settings;
+        savePreferences();
         render();
-        showToast("Local prototype data deleted");
+        showToast("This device's Careview preferences were reset");
       }
     }
+  });
+
+  document.addEventListener("submit", async (event) => {
+    const form = event.target.closest("form[data-form]");
+    if (!form) return;
+    event.preventDefault();
+    const formData = new FormData(form);
+    const kind = form.dataset.form;
+
+    if (kind === "login" || kind === "setup") {
+      if (authBusy) return;
+      authDraft.email = String(formData.get("email") || "").trim();
+      authDraft.workspaceName = kind === "setup" ? String(formData.get("workspaceName") || "").trim() : "";
+      authDraft.displayName = kind === "setup" ? String(formData.get("displayName") || "").trim() : "";
+      authBusy = true;
+      authError = "";
+      render();
+      const body = {
+        email: String(formData.get("email") || "").trim(),
+        password: String(formData.get("password") || ""),
+      };
+      if (kind === "setup") {
+        body.workspaceName = String(formData.get("workspaceName") || "").trim();
+        body.displayName = String(formData.get("displayName") || "").trim();
+      }
+      try {
+        await apiFetch(kind === "setup" ? "/api/setup" : "/api/login", { method: "POST", body: JSON.stringify(body) });
+        authBusy = false;
+        authDraft = { workspaceName: "", displayName: "", email: "" };
+        await bootstrapSession();
+      } catch (error) {
+        authBusy = false;
+        authError = kind === "login" ? "Email or password was not accepted." : error.message;
+        render();
+        requestAnimationFrame(() => document.querySelector("#auth-email")?.focus());
+      }
+      return;
+    }
+
+    if (kind === "add-patient") {
+      if (patientMutationBusy) return;
+      patientDraft = {
+        displayName: String(formData.get("displayName") || "").trim(),
+        careLocation: String(formData.get("careLocation") || "").trim(),
+      };
+      patientMutationBusy = true;
+      patientError = "";
+      render();
+      try {
+        const payload = await apiFetch("/api/patients", {
+          method: "POST",
+          body: JSON.stringify({
+            displayName: patientDraft.displayName,
+            careLocation: patientDraft.careLocation,
+          }),
+        });
+        const patient = payload.patient ?? payload;
+        patientDirectory = [patient, ...patientDirectory.filter((item) => String(item?.id) !== String(patient?.id))];
+        patientMutationBusy = false;
+        patientDraft = { displayName: "", careLocation: "" };
+        await selectPatient(patient);
+      } catch (error) {
+        patientMutationBusy = false;
+        patientError = error.message;
+        render();
+      }
+      return;
+    }
+
+    if (kind === "add-user" && isAdminUser()) {
+      staffDraft = {
+        displayName: String(formData.get("displayName") || "").trim(),
+        email: String(formData.get("email") || "").trim(),
+      };
+      staffLoading = true;
+      staffError = "";
+      render();
+      try {
+        await apiFetch("/api/users", {
+          method: "POST",
+          body: JSON.stringify({
+            displayName: staffDraft.displayName,
+            email: staffDraft.email,
+            password: String(formData.get("password") || ""),
+          }),
+        });
+        staffLoading = false;
+        staffDraft = { displayName: "", email: "" };
+        await loadStaffUsers();
+        showToast("Healthcare user added");
+      } catch (error) {
+        staffLoading = false;
+        staffError = error.message;
+        render();
+      }
+    }
+  });
+
+  document.addEventListener("input", (event) => {
+    if (event.target.id !== "patient-search") return;
+    patientQuery = event.target.value.slice(0, 100);
+    patientSearchOpen = Boolean(patientQuery.trim());
+    patientActiveIndex = -1;
+    clearTimeout(patientSearchTimer);
+    if (!patientSearchOpen) {
+      patientSuggestions = patientDirectory;
+      render();
+      restorePatientSearchFocus();
+      return;
+    }
+    patientSearchTimer = setTimeout(() => loadPatientDirectory(patientQuery.trim(), { restoreSearchFocus: true }), 250);
+  });
+
+  document.addEventListener("focusin", (event) => {
+    if (event.target.id !== "patient-search" || !patientQuery.trim()) return;
+    patientSearchOpen = true;
+    document.querySelector("#patient-suggestions")?.removeAttribute("hidden");
+    event.target.setAttribute("aria-expanded", "true");
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.target.id !== "patient-search" || !patientSearchOpen) return;
+    const options = [...document.querySelectorAll("#patient-suggestions .patient-option")];
+    if (event.key === "Escape") {
+      patientSearchOpen = false;
+      patientActiveIndex = -1;
+      event.target.setAttribute("aria-expanded", "false");
+      document.querySelector("#patient-suggestions")?.setAttribute("hidden", "");
+      event.preventDefault();
+      return;
+    }
+    if (!["ArrowDown", "ArrowUp", "Enter"].includes(event.key) || !options.length) return;
+    event.preventDefault();
+    if (event.key === "Enter") {
+      options[Math.max(0, patientActiveIndex)].click();
+      return;
+    }
+    if (event.key === "ArrowDown") patientActiveIndex = (patientActiveIndex + 1) % options.length;
+    if (event.key === "ArrowUp") patientActiveIndex = (patientActiveIndex - 1 + options.length) % options.length;
+    options.forEach((option, index) => option.setAttribute("aria-selected", String(index === patientActiveIndex)));
+    event.target.setAttribute("aria-activedescendant", options[patientActiveIndex].id);
+    options[patientActiveIndex].scrollIntoView({ block: "nearest" });
   });
 
   document.addEventListener("change", (event) => {
@@ -1734,7 +2423,9 @@
   window.addEventListener("popstate", (event) => {
     if (analysisTimer || analysisController) cancelActiveAnalysis();
     const historyState = event.state || { route: "home", scanStep: 1 };
-    const nextRoute = historyState.route === "analyzing" ? "scan" : historyState.route;
+    let nextRoute = historyState.route === "analyzing" ? "scan" : historyState.route;
+    if (!session.authenticated) nextRoute = "patients";
+    if (!selectedPatient && ["home", "scan", "analyzing", "results", "history"].includes(nextRoute)) nextRoute = "patients";
     const nextStep = historyState.route === "analyzing" ? 3 : historyState.scanStep || 1;
     const leavingCapture = currentRoute === "scan" && (nextRoute !== "scan" || (scanStep === 2 && nextStep === 1));
     const leavingInFlightCheck = currentRoute === "analyzing" && !["scan", "results"].includes(nextRoute);
@@ -1758,7 +2449,10 @@
     if (!event.persisted) return;
     if (currentRoute === "analyzing") currentRoute = "scan";
     if (currentRoute === "scan" && scanStep > 1 && !mediaPreview && !isDemoMedia) scanStep = 2;
-    render();
+    bootstrapSession();
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") revalidateSession();
   });
   document.addEventListener("keydown", (event) => {
     if (sheet.hidden) return;
@@ -1785,6 +2479,6 @@
     window.addEventListener("load", () => navigator.serviceWorker.register("./sw.js").catch(() => {}));
   }
 
-  window.history.replaceState({ route: "home", scanStep: 0 }, "");
-  render();
+  window.history.replaceState({ route: "patients", scanStep: 0 }, "");
+  bootstrapSession();
 })();

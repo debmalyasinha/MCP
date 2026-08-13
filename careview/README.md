@@ -4,6 +4,12 @@ Careview is an installable, mobile-first web app for caregivers who review conse
 
 Careview is not a monitoring or emergency system. It does not diagnose a condition, determine nutrition or medication adherence, judge neglect or care quality, or prove a habit from one scene. If someone may be in immediate danger, check in person and contact local emergency services.
 
+> **Synthetic test data only.** The local prototype now includes healthcare-user
+> authentication and a shared workspace patient directory, but it is not an
+> electronic health record or a production healthcare system. Do not enter real
+> patient information or reuse a real workplace password, especially over the
+> plain-HTTP LAN mode.
+
 ## What the current build does
 
 - Captures or selects an image or a 1-30 second video on iPhone.
@@ -12,6 +18,9 @@ Careview is not a monitoring or emergency system. It does not diagnose a conditi
 - Converts an image to one resized JPEG before upload.
 - Samples up to six timestamped JPEG frames from a video in the browser. The raw video and its audio are not uploaded.
 - Calls a same-origin Python backend, which keeps the OpenAI API key off the phone.
+- Uses server-side healthcare-user sessions and a shared SQLite patient directory.
+- Lets workspace administrators add healthcare users; users in that workspace can search and review the same synthetic patient records.
+- Stores derived AI scene results and human review notes on the server without retaining source photos or videos.
 - Uses a strict structured response and validates it again before showing it.
 - Separates assessed, unable-to-assess, refused, incomplete, and service-error states.
 - Lets a caregiver confirm, correct, dismiss, annotate, and resolve observations.
@@ -36,11 +45,30 @@ prompt for its unlock password, but the OpenAI API key does not need to be
 entered again. Open [http://127.0.0.1:4173](http://127.0.0.1:4173) and stop the
 server with `Ctrl+C`.
 
+On the first visit from the server computer, create the workspace administrator
+account. Initial setup is intentionally blocked from other LAN devices. Use a
+unique password of at least 14 characters with upper- and lowercase letters, a
+number, and a symbol. After setup, Careview shows the login screen on every
+device. The administrator can add additional healthcare test users from the
+**Healthcare staff** section on the **Care** screen. Passwords use salted scrypt
+hashes; session and CSRF tokens are stored only as hashes in the local SQLite
+database.
+
 Under the hood, the launcher sets `OPENAI_API_KEY` only for the process and runs
 `python careview\server.py`; use the launcher so the key is never typed or stored
 in the repository.
 
 `OPENAI_MODEL` is optional; the server defaults to `gpt-5.6-terra`.
+
+When an HTTPS reverse proxy fronts the local server, also pass
+`-SecureCookie` so the browser sends session cookies only over HTTPS:
+
+```powershell
+.\careview\scripts\start-careview.ps1 -SecureCookie
+```
+
+Do not use `-SecureCookie` with the direct plain-HTTP LAN address; browsers will
+not return that cookie over HTTP.
 
 ## Open it on an iPhone over the same Wi-Fi
 
@@ -59,7 +87,11 @@ http://YOUR-WINDOWS-IP:4173/
 
 For the current computer that was `http://192.168.2.221:4173/`; it can change after reconnecting. Do not use the public IP address. If the page times out, set the trusted home Wi-Fi profile to Private and allow Python through Windows Defender Firewall on Private networks only. Keep the server window open and the computer awake.
 
-This LAN setup uses plain HTTP. It is only for short-lived interface and integration testing with non-sensitive media: uploaded frames are not encrypted in transit, and iPhone service-worker/install behavior requires a secure context. Do not use it for real resident imagery, medication information, or personal data.
+This LAN setup uses plain HTTP. Login credentials, session cookies, patient
+records, and uploaded frames are not encrypted in transit, and iPhone
+service-worker/install behavior requires a secure context. Use only synthetic
+users, patients, and non-sensitive media. Do not use real resident imagery,
+medication information, personal data, or a reused password.
 
 ## Install on an iPhone
 
@@ -86,7 +118,15 @@ The browser canvas removes file metadata and excludes audio while creating AI in
 
 The backend sends the prepared frames to the OpenAI Responses API with `store: false`. OpenAI API inputs and outputs are not used for model training by default, but default abuse-monitoring logs may retain customer content for up to 30 days unless the organization has approved Modified Abuse Monitoring or Zero Data Retention controls.
 
-The selected file remains in browser memory for preview and human verification during the current review; it is not written to browser storage or the service-worker cache. AI findings, caregiver notes, resident display name, and scene history are currently stored in unencrypted browser `localStorage`. Deleting local prototype data clears that browser state, but this prototype has no authenticated server-side record, remote revocation, managed backup deletion, or device lock policy.
+The selected file remains in browser memory for preview and human verification
+during the current review; it is not written to browser storage, SQLite, or the
+service-worker cache. Derived AI findings, healthcare-user review notes, patient
+display names, and scene history are stored in the local, unencrypted SQLite
+database at `careview/data/careview.db`. Browser `localStorage` contains only
+non-sensitive UI preferences. The prototype has authenticated server-side
+records and logout revocation, but it does not provide database encryption,
+managed backups, patient-specific access assignments, verified consent records,
+or production retention/deletion controls.
 
 Cancel stops the phone from waiting and displaying a result. If the server has already sent the request to OpenAI, the synchronous prototype server cannot cancel that provider request; it may continue until completion or its 45-second timeout.
 
@@ -102,7 +142,8 @@ Careview must therefore present AI output as a possible visible issue to verifyâ
 
 ## API shape
 
-The browser sends only prepared frames to `POST /api/analyze`:
+After authenticating and selecting an authorized patient, the browser sends only
+prepared frames to `POST /api/patients/{patientId}/analyze`:
 
 ```json
 {
@@ -119,7 +160,18 @@ The browser sends only prepared frames to `POST /api/analyze`:
 }
 ```
 
-The backend constrains request size and frame count, validates every data URL and timestamp, requests strict structured output, checks frame references and response lengths, and returns only normalized fields. A schema-valid result can still be factually wrong, so the caregiver must compare every observation with the visible source media.
+The backend verifies the session, workspace and CSRF token, constrains request
+size and frame count, validates every data URL and timestamp, requests strict
+structured output, checks frame references and response lengths, and persists
+only normalized derived fields. A schema-valid result can still be factually
+wrong, so the caregiver must compare every observation with the visible source
+media.
+
+Authentication and shared-record endpoints include:
+`GET /api/session`, `POST /api/login`, `POST /api/logout`,
+`GET /api/patients`, `POST /api/patients`,
+`GET /api/patients/{patientId}/scenes`, and optimistic `PATCH` updates for
+findings. Only administrators can list or add workspace healthcare users.
 
 ## Test
 
@@ -136,7 +188,9 @@ Manual browser testing should also cover iPhone portrait capture, HEIC/MOV suppo
 ## Production checklist
 
 - Serve the authenticated app and API over HTTPS; never expose the API key to clients.
-- Enforce resident/caregiver authorization, role-based access, session expiry, consent withdrawal, and rate limits.
+- Replace workspace-wide visibility with patient-specific assignments and minimum-necessary role permissions.
+- Add MFA or passkeys, workforce lifecycle controls, secure account recovery, consent withdrawal, and broader rate limits.
+- Encrypt the database, backups, and managed keys; test restoration, retention, deletion, and revocation.
 - Implement and verify face and identifier blocking/redaction before upload, not just a preference toggle.
 - Strip metadata and audio, minimize frames, disable sensitive request logging, and delete transient media on success, failure, timeout, or cancellation.
 - Keep only short-lived redacted evidence needed for human review, with explicit retention and revocation.
@@ -149,6 +203,7 @@ Manual browser testing should also cover iPhone portrait capture, HEIC/MOV suppo
 ```text
 careview/
 |-- server.py             # static server and protected OpenAI proxy
+|-- careview_store.py     # authenticated SQLite users, patients, scenes, and reviews
 |-- index.html            # accessible PWA shell
 |-- styles.css            # mobile and responsive presentation
 |-- app.js                # capture, frame preparation, AI/demo flows, review state
@@ -158,6 +213,7 @@ careview/
 |-- icon-192.png          # install icon
 |-- icon-512.png          # install and maskable icon
 |-- apple-touch-icon.png  # iOS Home Screen icon
+|-- data/                 # ignored local SQLite database created at runtime
 |-- scripts/
 |   |-- generate-icons.ps1
 |   `-- start-careview.ps1 # loads the API key from CareviewVault and starts the server

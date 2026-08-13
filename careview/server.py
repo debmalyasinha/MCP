@@ -13,12 +13,16 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+from http.cookies import CookieError, SimpleCookie
+import ipaddress
 import json
 import mimetypes
 import os
 import re
 import socket
 import sys
+import threading
+import time
 import unicodedata
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -26,8 +30,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 from urllib.request import Request, urlopen
+
+from careview_store import (
+    AuthenticationError,
+    AuthorizationError,
+    CareviewStore,
+    ConflictError,
+    NotFoundError,
+    StoreValidationError,
+)
 
 
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
@@ -42,6 +55,12 @@ MAX_VIDEO_TIMESTAMP_MS = 30_000
 MAX_VIDEO_FRAMES = 6
 MAX_FINDINGS = 6
 MAX_LIMITATIONS = 6
+MAX_AUTH_REQUEST_BYTES = 16 * 1024
+MAX_PATIENT_REQUEST_BYTES = 16 * 1024
+SESSION_COOKIE_NAME = "careview_session"
+SESSION_COOKIE_MAX_AGE = 8 * 60 * 60
+LOGIN_WINDOW_SECONDS = 5 * 60
+LOGIN_ATTEMPT_LIMIT = 10
 
 ALLOWED_ZONES = {"kitchen", "fridge", "medication", "living"}
 ZONE_LABELS = {
@@ -101,7 +120,34 @@ SECURITY_HEADERS = {
     ),
     "Referrer-Policy": "no-referrer",
     "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Permissions-Policy": "camera=(self), microphone=(), geolocation=()",
 }
+
+
+class LoginRateLimiter:
+    """Small in-memory brake for repeated password guesses from one address."""
+
+    def __init__(self, limit: int = LOGIN_ATTEMPT_LIMIT, window: int = LOGIN_WINDOW_SECONDS):
+        self.limit = limit
+        self.window = window
+        self._attempts: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+
+    def allowed(self, address: str) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            attempts = [value for value in self._attempts.get(address, []) if now - value < self.window]
+            self._attempts[address] = attempts
+            return len(attempts) < self.limit
+
+    def failed(self, address: str) -> None:
+        with self._lock:
+            self._attempts.setdefault(address, []).append(time.monotonic())
+
+    def succeeded(self, address: str) -> None:
+        with self._lock:
+            self._attempts.pop(address, None)
 
 
 class RequestValidationError(ValueError):
@@ -707,6 +753,9 @@ class CareviewHandler(BaseHTTPRequestHandler):
     server_version = "Careview/1.0"
     sys_version = ""
     static_root = Path(__file__).resolve().parent
+    store: CareviewStore
+    secure_cookie = False
+    login_limiter = LoginRateLimiter()
 
     def _send_headers(
         self,
@@ -715,6 +764,7 @@ class CareviewHandler(BaseHTTPRequestHandler):
         content_length: int,
         *,
         no_store: bool = False,
+        extra_headers: dict[str, str] | None = None,
     ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
@@ -723,11 +773,25 @@ class CareviewHandler(BaseHTTPRequestHandler):
             self.send_header(name, value)
         if no_store:
             self.send_header("Cache-Control", "no-store")
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
 
-    def _send_json(self, status: int, value: dict[str, Any]) -> None:
+    def _send_json(
+        self,
+        status: int,
+        value: dict[str, Any],
+        *,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
         encoded = json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-        self._send_headers(status, "application/json; charset=utf-8", len(encoded), no_store=True)
+        self._send_headers(
+            status,
+            "application/json; charset=utf-8",
+            len(encoded),
+            no_store=True,
+            extra_headers=extra_headers,
+        )
         if self.command != "HEAD":
             try:
                 self.wfile.write(encoded)
@@ -735,16 +799,207 @@ class CareviewHandler(BaseHTTPRequestHandler):
                 # The browser can cancel while an already-sent provider request finishes.
                 pass
 
-    def _send_error_json(self, status: int, code: str, message: str) -> None:
-        self._send_json(status, {"error": {"code": code, "message": message}})
+    def _send_error_json(
+        self,
+        status: int,
+        code: str,
+        message: str,
+        *,
+        extra: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        error: dict[str, Any] = {"code": code, "message": message}
+        if extra:
+            error.update(extra)
+        self._send_json(status, {"error": error}, extra_headers=headers)
+
+    def _session_cookie(self, token: str, *, clear: bool = False) -> str:
+        cookie = SimpleCookie()
+        cookie[SESSION_COOKIE_NAME] = token
+        morsel = cookie[SESSION_COOKIE_NAME]
+        morsel["path"] = "/"
+        morsel["httponly"] = True
+        morsel["samesite"] = "Strict"
+        morsel["max-age"] = 0 if clear else SESSION_COOKIE_MAX_AGE
+        if self.secure_cookie:
+            morsel["secure"] = True
+        return morsel.OutputString()
+
+    def _raw_session_credentials(self) -> tuple[str, str] | None:
+        header = self.headers.get("Cookie", "")
+        if not header or len(header) > 4096:
+            return None
+        try:
+            cookie = SimpleCookie()
+            cookie.load(header)
+        except CookieError:
+            return None
+        morsel = cookie.get(SESSION_COOKIE_NAME)
+        if morsel is None:
+            return None
+        parts = morsel.value.split(".")
+        if len(parts) != 2 or any(
+            not re.fullmatch(r"[A-Za-z0-9_-]{32,256}", value) for value in parts
+        ):
+            return None
+        return parts[0], parts[1]
+
+    def _session_context(self) -> dict[str, Any] | None:
+        credentials = self._raw_session_credentials()
+        if credentials is None:
+            return None
+        try:
+            context = self.store.authenticate(credentials[0])
+        except AuthenticationError:
+            return None
+        if context is None or not self.store.verify_csrf(context, credentials[1]):
+            return None
+        context = dict(context)
+        context["csrfToken"] = credentials[1]
+        return context
+
+    def _require_session(self) -> dict[str, Any] | None:
+        context = self._session_context()
+        if context is None:
+            self._send_error_json(
+                HTTPStatus.UNAUTHORIZED,
+                "authentication_required",
+                "Sign in to continue.",
+                headers={"Set-Cookie": self._session_cookie("", clear=True)},
+            )
+        return context
+
+    def _require_csrf(self, context: dict[str, Any]) -> bool:
+        token = self.headers.get("X-CSRF-Token", "")
+        if not token or len(token) > 256 or not self.store.verify_csrf(context, token):
+            self._send_error_json(
+                HTTPStatus.FORBIDDEN,
+                "csrf_invalid",
+                "The request could not be verified. Refresh and try again.",
+            )
+            return False
+        return True
+
+    def _read_json(self, maximum: int) -> Any:
+        if self.headers.get_content_type() != "application/json":
+            raise RequestValidationError("Content-Type must be application/json.")
+        raw_length = self.headers.get("Content-Length")
+        try:
+            length = int(raw_length) if raw_length is not None else -1
+        except ValueError:
+            length = -1
+        if length < 0:
+            raise RequestValidationError("Content-Length is required.")
+        if length == 0:
+            raise RequestValidationError("The request body cannot be empty.")
+        if length > maximum:
+            raise OverflowError
+        raw_body = self.rfile.read(length)
+        if len(raw_body) != length:
+            raise RequestValidationError("The request body was incomplete.")
+        try:
+            return json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RequestValidationError("The request body is not valid JSON.") from exc
+
+    def _read_api_json(self, maximum: int) -> Any | None:
+        try:
+            return self._read_json(maximum)
+        except OverflowError:
+            self._send_error_json(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                "request_too_large",
+                "The request is too large.",
+            )
+        except RequestValidationError as exc:
+            message = str(exc)
+            if message.startswith("Content-Type"):
+                status, code = HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type"
+            elif message.startswith("Content-Length"):
+                status, code = HTTPStatus.LENGTH_REQUIRED, "length_required"
+            elif message.endswith("not valid JSON."):
+                status, code = HTTPStatus.BAD_REQUEST, "invalid_json"
+            else:
+                status, code = HTTPStatus.BAD_REQUEST, "invalid_request"
+            self._send_error_json(status, code, message)
+        return None
+
+    def _handle_store_error(self, exc: Exception) -> None:
+        if isinstance(exc, AuthenticationError):
+            self._send_error_json(HTTPStatus.UNAUTHORIZED, "authentication_required", "Sign in to continue.")
+        elif isinstance(exc, AuthorizationError):
+            self._send_error_json(HTTPStatus.FORBIDDEN, "forbidden", "You do not have access to this resource.")
+        elif isinstance(exc, NotFoundError):
+            self._send_error_json(HTTPStatus.NOT_FOUND, "not_found", "Resource not found.")
+        elif isinstance(exc, ConflictError):
+            current = getattr(exc, "current", None)
+            self._send_error_json(
+                HTTPStatus.CONFLICT,
+                "conflict",
+                "This record changed since it was opened. Refresh and try again.",
+                extra={"currentFinding": current} if current else None,
+            )
+        else:
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        path = unquote(urlsplit(self.path).path)
+        parsed = urlsplit(self.path)
+        path = unquote(parsed.path)
         if path == "/api/health":
             self._send_json(
                 HTTPStatus.OK,
                 {"status": "ok", "aiConfigured": bool(os.environ.get("OPENAI_API_KEY", "").strip())},
             )
+            return
+        if path == "/api/session":
+            context = self._session_context()
+            response: dict[str, Any] = {
+                "authenticated": context is not None,
+                "setupRequired": self.store.setup_required(),
+            }
+            if context is not None:
+                response["user"] = context["user"]
+                response["csrfToken"] = context["csrfToken"]
+                response["expiresAt"] = context["expiresAt"]
+            self._send_json(HTTPStatus.OK, response)
+            return
+        if path == "/api/users":
+            context = self._require_session()
+            if context is None:
+                return
+            try:
+                self._send_json(HTTPStatus.OK, {"users": self.store.list_users(context)})
+            except (AuthenticationError, AuthorizationError, StoreValidationError) as exc:
+                self._handle_store_error(exc)
+            return
+        if path == "/api/patients":
+            context = self._require_session()
+            if context is None:
+                return
+            query = parse_qs(parsed.query, keep_blank_values=True).get("q", [""])[0]
+            try:
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"patients": self.store.list_patients(context, query)},
+                )
+            except (AuthenticationError, StoreValidationError) as exc:
+                self._handle_store_error(exc)
+            return
+        scene_match = re.fullmatch(r"/api/patients/([^/]+)/scenes", path)
+        if scene_match:
+            context = self._require_session()
+            if context is None:
+                return
+            try:
+                patient_id = scene_match.group(1)
+                patient = self.store.get_patient(context, patient_id)
+                scenes = self.store.list_scenes(context, patient_id)
+                self._send_json(HTTPStatus.OK, {"patient": patient, "scenes": scenes})
+            except (AuthenticationError, NotFoundError, StoreValidationError) as exc:
+                self._handle_store_error(exc)
+            return
+        if path.startswith("/api/"):
+            self._send_error_json(HTTPStatus.NOT_FOUND, "not_found", "Resource not found.")
             return
         self._serve_static(path)
 
@@ -779,41 +1034,190 @@ class CareviewHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        if urlsplit(self.path).path != "/api/analyze":
+        path = unquote(urlsplit(self.path).path)
+        if path == "/api/setup":
+            self._post_setup()
+            return
+        if path == "/api/login":
+            self._post_login()
+            return
+        if path == "/api/logout":
+            context = self._require_session()
+            if context is None or not self._require_csrf(context):
+                return
+            self.store.logout(context)
+            self._send_json(
+                HTTPStatus.OK,
+                {"authenticated": False},
+                extra_headers={"Set-Cookie": self._session_cookie("", clear=True)},
+            )
+            return
+        if path == "/api/users":
+            self._post_user()
+            return
+        if path == "/api/patients":
+            self._post_patient()
+            return
+        analyze_match = re.fullmatch(r"/api/patients/([^/]+)/analyze", path)
+        if analyze_match:
+            self._post_analyze(analyze_match.group(1))
+            return
+        self._send_error_json(HTTPStatus.NOT_FOUND, "not_found", "Resource not found.")
+
+    def do_PATCH(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        path = unquote(urlsplit(self.path).path)
+        match = re.fullmatch(r"/api/patients/([^/]+)/findings/([^/]+)", path)
+        if not match:
             self._send_error_json(HTTPStatus.NOT_FOUND, "not_found", "Resource not found.")
             return
-        content_type = self.headers.get_content_type()
-        if content_type != "application/json":
-            self._send_error_json(
-                HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
-                "unsupported_media_type",
-                "Content-Type must be application/json.",
-            )
+        context = self._require_session()
+        if context is None or not self._require_csrf(context):
             return
-        raw_length = self.headers.get("Content-Length")
+        payload = self._read_api_json(MAX_PATIENT_REQUEST_BYTES)
+        if payload is None:
+            return
         try:
-            length = int(raw_length) if raw_length is not None else -1
+            if not isinstance(payload, dict) or set(payload) != {"status", "note", "version"}:
+                raise StoreValidationError("status, note, and version are required.")
+            finding = self.store.update_finding(
+                context,
+                match.group(1),
+                match.group(2),
+                payload["status"],
+                payload["note"],
+                payload["version"],
+            )
+            self._send_json(HTTPStatus.OK, {"finding": finding})
+        except (
+            AuthenticationError,
+            AuthorizationError,
+            ConflictError,
+            NotFoundError,
+            StoreValidationError,
+        ) as exc:
+            self._handle_store_error(exc)
+
+    def _post_setup(self) -> None:
+        try:
+            is_loopback = ipaddress.ip_address(self.client_address[0]).is_loopback
         except ValueError:
-            length = -1
-        if length < 0:
-            self._send_error_json(HTTPStatus.LENGTH_REQUIRED, "length_required", "Content-Length is required.")
-            return
-        if length == 0 or length > MAX_REQUEST_BYTES:
+            is_loopback = False
+        if not is_loopback:
             self._send_error_json(
-                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
-                "request_too_large",
-                "The analysis request is empty or too large.",
+                HTTPStatus.FORBIDDEN,
+                "setup_local_only",
+                "Initial setup must be completed on the server computer.",
             )
             return
-        try:
-            raw_body = self.rfile.read(length)
-            if len(raw_body) != length:
-                raise RequestValidationError("The request body was incomplete.")
-            payload = json.loads(raw_body.decode("utf-8"))
-            validated = validate_analysis_payload(payload)
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            self._send_error_json(HTTPStatus.BAD_REQUEST, "invalid_json", "The request body is not valid JSON.")
+        if not self.store.setup_required():
+            self._send_error_json(
+                HTTPStatus.CONFLICT,
+                "setup_complete",
+                "Initial setup has already been completed.",
+            )
             return
+        payload = self._read_api_json(MAX_AUTH_REQUEST_BYTES)
+        if payload is None:
+            return
+        try:
+            if not isinstance(payload, dict) or set(payload) != {
+                "workspaceName", "displayName", "email", "password"
+            }:
+                raise StoreValidationError("workspaceName, displayName, email, and password are required.")
+            user, session_token, csrf_token = self.store.setup(
+                payload["workspaceName"], payload["displayName"], payload["email"], payload["password"]
+            )
+            self._send_json(
+                HTTPStatus.CREATED,
+                {"user": user, "csrfToken": csrf_token},
+                extra_headers={"Set-Cookie": self._session_cookie(f"{session_token}.{csrf_token}")},
+            )
+        except (ConflictError, StoreValidationError) as exc:
+            self._handle_store_error(exc)
+
+    def _post_login(self) -> None:
+        address = self.client_address[0]
+        if not self.login_limiter.allowed(address):
+            self._send_error_json(
+                HTTPStatus.TOO_MANY_REQUESTS,
+                "login_rate_limited",
+                "Too many sign-in attempts. Try again later.",
+                headers={"Retry-After": str(LOGIN_WINDOW_SECONDS)},
+            )
+            return
+        payload = self._read_api_json(MAX_AUTH_REQUEST_BYTES)
+        if payload is None:
+            return
+        try:
+            if not isinstance(payload, dict) or set(payload) != {"email", "password"}:
+                raise StoreValidationError("email and password are required.")
+            result = self.store.login(payload["email"], payload["password"])
+        except StoreValidationError:
+            result = None
+        if result is None:
+            self.login_limiter.failed(address)
+            self._send_error_json(
+                HTTPStatus.UNAUTHORIZED,
+                "invalid_credentials",
+                "The email or password is incorrect.",
+            )
+            return
+        self.login_limiter.succeeded(address)
+        user, session_token, csrf_token = result
+        self._send_json(
+            HTTPStatus.OK,
+            {"user": user, "csrfToken": csrf_token},
+            extra_headers={"Set-Cookie": self._session_cookie(f"{session_token}.{csrf_token}")},
+        )
+
+    def _post_user(self) -> None:
+        context = self._require_session()
+        if context is None or not self._require_csrf(context):
+            return
+        payload = self._read_api_json(MAX_AUTH_REQUEST_BYTES)
+        if payload is None:
+            return
+        try:
+            if not isinstance(payload, dict) or set(payload) != {"displayName", "email", "password"}:
+                raise StoreValidationError("displayName, email, and password are required.")
+            user = self.store.create_user(
+                context, payload["displayName"], payload["email"], payload["password"]
+            )
+            self._send_json(HTTPStatus.CREATED, {"user": user})
+        except (AuthenticationError, AuthorizationError, ConflictError, StoreValidationError) as exc:
+            self._handle_store_error(exc)
+
+    def _post_patient(self) -> None:
+        context = self._require_session()
+        if context is None or not self._require_csrf(context):
+            return
+        payload = self._read_api_json(MAX_PATIENT_REQUEST_BYTES)
+        if payload is None:
+            return
+        try:
+            if not isinstance(payload, dict) or set(payload) != {"displayName", "careLocation"}:
+                raise StoreValidationError("displayName and careLocation are required.")
+            patient = self.store.create_patient(
+                context, payload["displayName"], payload["careLocation"]
+            )
+            self._send_json(HTTPStatus.CREATED, {"patient": patient})
+        except (AuthenticationError, ConflictError, StoreValidationError) as exc:
+            self._handle_store_error(exc)
+
+    def _post_analyze(self, patient_id: str) -> None:
+        context = self._require_session()
+        if context is None or not self._require_csrf(context):
+            return
+        try:
+            self.store.get_patient(context, patient_id)
+        except (AuthenticationError, NotFoundError, StoreValidationError) as exc:
+            self._handle_store_error(exc)
+            return
+        payload = self._read_api_json(MAX_REQUEST_BYTES)
+        if payload is None:
+            return
+        try:
+            validated = validate_analysis_payload(payload)
         except RequestValidationError as exc:
             self._send_error_json(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
             return
@@ -864,22 +1268,50 @@ class CareviewHandler(BaseHTTPRequestHandler):
                 "The analysis could not be completed.",
             )
             return
-        self._send_json(HTTPStatus.OK, result)
+        try:
+            scene = self.store.create_scene(
+                context,
+                patient_id,
+                {
+                    "zone": validated.zone,
+                    "mediaType": validated.media_type,
+                    "durationSeconds": validated.duration_seconds,
+                    "framesSubmitted": len(validated.frames),
+                },
+                result,
+            )
+        except (AuthenticationError, NotFoundError, StoreValidationError) as exc:
+            self._handle_store_error(exc)
+            return
+        response = dict(result)
+        response["scene"] = scene
+        self._send_json(HTTPStatus.OK, response)
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        # BaseHTTPRequestHandler only provides method/path/status here. Never log bodies or headers.
-        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+        # Keep patient and finding identifiers out of request logs.
+        status = str(args[1]) if len(args) > 1 else "-"
+        sys.stderr.write(f"{self.address_string()} - {self.command} {status}\n")
 
 
 def create_server(
-    host: str = "127.0.0.1", port: int = 4173, static_root: Path | None = None
+    host: str = "127.0.0.1",
+    port: int = 4173,
+    static_root: Path | None = None,
+    db_path: Path | None = None,
+    *,
+    secure_cookie: bool = False,
 ) -> ThreadingHTTPServer:
     root = (static_root or Path(__file__).resolve().parent).resolve()
+    database = (db_path or (Path(__file__).resolve().parent / "data" / "careview.db")).resolve()
+    store = CareviewStore(database)
 
     class ConfiguredCareviewHandler(CareviewHandler):
         pass
 
     ConfiguredCareviewHandler.static_root = root
+    ConfiguredCareviewHandler.store = store
+    ConfiguredCareviewHandler.secure_cookie = secure_cookie
+    ConfiguredCareviewHandler.login_limiter = LoginRateLimiter()
     return ThreadingHTTPServer((host, port), ConfiguredCareviewHandler)
 
 
@@ -899,8 +1331,25 @@ def main() -> None:
         default=Path(__file__).resolve().parent,
         help="Careview static asset directory.",
     )
+    parser.add_argument(
+        "--database",
+        type=Path,
+        default=Path(__file__).resolve().parent / "data" / "careview.db",
+        help="SQLite database path (default: careview/data/careview.db).",
+    )
+    parser.add_argument(
+        "--secure-cookie",
+        action="store_true",
+        help="Mark session cookies Secure (required when serving over HTTPS).",
+    )
     args = parser.parse_args()
-    server = create_server(args.host, args.port, args.directory)
+    server = create_server(
+        args.host,
+        args.port,
+        args.directory,
+        args.database,
+        secure_cookie=args.secure_cookie,
+    )
     print(f"Careview is available at http://{args.host}:{server.server_port}")
     print("Press Ctrl+C to stop. OPENAI_API_KEY remains server-side.")
     try:

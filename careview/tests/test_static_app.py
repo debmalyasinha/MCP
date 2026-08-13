@@ -178,7 +178,7 @@ class StaticAppTests(unittest.TestCase):
 
     def test_ai_client_uses_server_proxy_and_prepares_only_still_images(self):
         for hook in (
-            'fetch("/api/analyze"',
+            '/api/patients/${encodeURIComponent(patientId)}/analyze',
             'credentials: "same-origin"',
             'cache: "no-store"',
             "prepareImageForAnalysis",
@@ -211,8 +211,8 @@ class StaticAppTests(unittest.TestCase):
         for phrase in (
             "automated redaction is not active",
             "raw video and audio stay local",
-            "abuse-monitoring logs for up to 30 days",
-            "unencrypted localstorage",
+            "shared workspace",
+            "never in browser storage",
             "not emergency monitoring",
         ):
             self.assertIn(phrase, normalized)
@@ -236,11 +236,115 @@ class StaticAppTests(unittest.TestCase):
         self.assertNotIn("service reported ${framesAnalyzed} analyzed", self.js)
 
     def test_real_mode_does_not_start_with_urgent_demo_cards(self):
-        default_state = re.search(r"const defaultState = \{(.+?)\n  \};", self.js, re.DOTALL)
+        default_state = re.search(r"let state = \{(.+?)\n  \};", self.js, re.DOTALL)
         self.assertIsNotNone(default_state)
         self.assertIn("findings: []", default_state.group(0))
         self.assertIn("scans: []", default_state.group(0))
         self.assertNotIn("urgencyLabel", default_state.group(0))
+
+    def test_authentication_setup_and_csrf_contracts_exist(self):
+        for hook in (
+            'apiFetch("/api/session")',
+            '"/api/setup"',
+            '"/api/login"',
+            '"/api/logout"',
+            'headers.set("X-CSRF-Token", session.csrfToken)',
+            'credentials: "same-origin"',
+            'data-form="${setup ? "setup" : "login"}"',
+            "bootstrapSession()",
+        ):
+            self.assertIn(hook, self.js)
+        self.assertIn('id="app-header" hidden', self.html)
+        self.assertIn('id="primary-navigation"', self.html)
+        self.assertIn('minlength="${setup ? 14 : 1}" maxlength="200"', self.js)
+        self.assertRegex(self.js, r'id="staff-password"[^>]+minlength="14"[^>]+maxlength="200"')
+        self.assertIn("uppercase, lowercase, a number, and a symbol", self.js)
+        self.assertNotIn('minlength="8"', self.js)
+
+    def test_failed_logout_preserves_the_active_local_session(self):
+        sign_out = self.js[
+            self.js.index("async function signOut()") : self.js.index("async function saveFindingReview()")
+        ]
+        self.assertIn('showToast("Sign-out failed. You are still signed in.")', sign_out)
+        self.assertRegex(
+            sign_out,
+            re.compile(r"catch \(error\) \{.+?return;\s+\}.+?transitionToSignedOut\(\);", re.DOTALL),
+        )
+        self.assertNotIn("clearSensitiveClientState", sign_out)
+
+    def test_visible_tab_always_revalidates_the_server_session(self):
+        revalidation = self.js[
+            self.js.index("function revalidateSession()") : self.js.index("function renderAuthScreen")
+        ]
+        self.assertIn('apiFetch("/api/session")', revalidation)
+        self.assertIn("payload.authenticated !== true", revalidation)
+        self.assertIn("transitionToSignedOut", revalidation)
+        self.assertIn("loadPatientScenes(selectedPatient, { quiet: true })", revalidation)
+        self.assertIn(
+            'if (document.visibilityState === "visible") revalidateSession();', self.js
+        )
+
+    def test_server_session_expiry_has_one_replaceable_sign_out_timer(self):
+        scheduler = self.js[
+            self.js.index("function clearSessionExpiryTimer()") : self.js.index("function transitionToSignedOut")
+        ]
+        self.assertIn("clearTimeout(sessionExpiryTimer)", scheduler)
+        self.assertIn("Number(expiresAt)", scheduler)
+        self.assertIn("Date.now()", scheduler)
+        self.assertIn("setTimeout(() => transitionToSignedOut(), delay)", scheduler)
+        self.assertIn("clearSessionExpiryTimer();\n    clearSensitiveClientState();", self.js)
+        self.assertGreaterEqual(self.js.count("scheduleSessionExpiry(session.expiresAt)"), 2)
+        self.assertIn("expiresAt: Number.isFinite(Number(payload.expiresAt))", self.js)
+
+    def test_patient_picker_is_accessible_and_patient_scoped(self):
+        for hook in (
+            'role="combobox"',
+            'aria-autocomplete="list"',
+            'role="listbox"',
+            'aria-activedescendant',
+            'event.key === "ArrowDown"',
+            'event.key === "ArrowUp"',
+            'event.key === "Escape"',
+            'data-form="add-patient"',
+            'apiFetch("/api/patients"',
+            '/api/patients/${encodeURIComponent(requestedId)}/scenes',
+            "analysisPatientId",
+        ):
+            self.assertIn(hook, self.js)
+
+    def test_shared_review_and_admin_staff_contracts_exist(self):
+        for hook in (
+            '/findings/${encodeURIComponent(finding.id)}',
+            'method: "PATCH"',
+            "version:",
+            "error.status === 409",
+            'apiFetch("/api/users")',
+            'data-form="add-user"',
+            'String(user?.role || "").toLowerCase() === "admin"',
+        ):
+            self.assertIn(hook, self.js)
+
+    def test_patient_data_and_tokens_are_not_persisted_in_browser_storage(self):
+        save_preferences = re.search(
+            r"function savePreferences\(\) \{(.+?)\n  \}", self.js, re.DOTALL
+        )
+        self.assertIsNotNone(save_preferences)
+        saved = save_preferences.group(0)
+        self.assertIn("settings:", saved)
+        for forbidden in ("selectedPatientId", "findings:", "scans:", "csrfToken", "patientDirectory", "selectedPatient:"):
+            self.assertNotIn(forbidden, saved)
+        self.assertNotIn("selectedPatientId", self.js)
+        self.assertNotIn("sessionStorage", self.js)
+        self.assertNotIn('localStorage.setItem(LEGACY_STORAGE_KEY', self.js)
+        self.assertEqual(set(re.findall(r"localStorage\.setItem\(([^,]+),", self.js)), {"PREFERENCES_KEY"})
+
+    def test_no_hard_coded_caregiver_or_patient_identity_remains(self):
+        for identity in ("Sarah", "Margaret Ellis", "Margaret's"):
+            self.assertNotIn(identity, self.html)
+            self.assertNotIn(identity, self.js)
+
+    def test_service_worker_never_intercepts_api_requests(self):
+        self.assertIn('requestUrl.pathname.startsWith("/api/")', self.worker)
 
     def test_readme_documents_server_side_ai_setup_and_prototype_limits(self):
         normalized = self.readme.lower()

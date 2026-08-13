@@ -168,6 +168,11 @@ main {
   padding-bottom: calc(100px + var(--safe-bottom));
 }
 
+.app-shell.auth-mode main {
+  min-height: 100dvh;
+  padding-bottom: 0;
+}
+
 .screen {
   animation: screen-in 280ms ease both;
 }
@@ -1915,7 +1920,7 @@ button.setting-row {
   bottom: 0;
   left: max(calc((100vw - 480px) / 2), 0px);
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   height: calc(72px + var(--safe-bottom));
   padding: 8px 30px calc(8px + var(--safe-bottom));
   background: rgba(255, 255, 255, 0.94);
@@ -2230,6 +2235,248 @@ button.setting-row {
   padding: 20px;
   text-align: center;
 }
+
+.auth-screen {
+  display: grid;
+  min-height: 100dvh;
+  align-content: center;
+  gap: 20px;
+  padding: max(32px, calc(22px + var(--safe-top))) 20px max(32px, calc(22px + var(--safe-bottom)));
+  background:
+    radial-gradient(circle at 90% 8%, rgba(132, 197, 172, 0.28), transparent 16rem),
+    var(--canvas);
+}
+
+.auth-card {
+  padding: 25px 22px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow);
+}
+
+.auth-card h1 {
+  margin-bottom: 9px;
+  font-size: clamp(27px, 8vw, 36px);
+}
+
+.auth-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 30px;
+  color: var(--forest-900);
+  font-size: 21px;
+}
+
+.auth-brand .brand-mark svg {
+  width: 22px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+}
+
+.auth-privacy {
+  max-width: 390px;
+  margin: 0 auto;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.auth-form,
+.stack-form {
+  display: grid;
+  gap: 8px;
+  margin-top: 22px;
+}
+
+.field-label {
+  margin-top: 6px;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 750;
+}
+
+.text-input {
+  width: 100%;
+  min-height: 48px;
+  padding: 11px 13px;
+  color: var(--ink);
+  background: white;
+  border: 1px solid #c9d3ce;
+  border-radius: 13px;
+  font-size: 16px;
+}
+
+.text-input::placeholder { color: #77837f; }
+
+.field-help,
+.form-error {
+  margin: 3px 0 7px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.field-help { color: var(--muted); }
+
+.form-error {
+  padding: 10px 12px;
+  color: #8d3829;
+  background: var(--coral-soft);
+  border: 1px solid #f0c6bc;
+  border-radius: 12px;
+}
+
+.loading-state,
+.loading-row {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  color: var(--muted);
+}
+
+.loading-state h1,
+.loading-state p { margin: 0; }
+.loading-state p { margin-top: 5px; }
+.loading-row { min-height: 70px; justify-content: center; padding: 16px; }
+
+.loading-spinner {
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  border: 3px solid var(--forest-100);
+  border-top-color: var(--forest-700);
+  border-radius: 50%;
+  animation: spinner 800ms linear infinite;
+}
+
+@keyframes spinner { to { transform: rotate(360deg); } }
+
+.patient-context {
+  display: grid;
+  width: 100%;
+  min-height: 58px;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 11px;
+  margin: 0 0 18px;
+  padding: 8px 11px;
+  text-align: left;
+  background: white;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  cursor: pointer;
+}
+
+.patient-context > span:nth-child(2) { min-width: 0; }
+.patient-context small,
+.patient-context strong { display: block; }
+.patient-context small { margin-bottom: 2px; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .08em; }
+.patient-context strong { overflow: hidden; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.patient-context > span:last-child { color: var(--forest-700); font-size: 12px; font-weight: 750; }
+
+.patient-search-wrap {
+  position: relative;
+  margin: 21px 0 25px;
+}
+
+.search-input-wrap { position: relative; margin-top: 7px; }
+.search-input-wrap > svg {
+  position: absolute;
+  z-index: 1;
+  top: 14px;
+  left: 13px;
+  width: 20px;
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 1.8;
+}
+.search-input-wrap .text-input { padding-left: 42px; }
+
+.suggestion-list {
+  position: absolute;
+  z-index: 25;
+  top: 79px;
+  right: 0;
+  left: 0;
+  max-height: 260px;
+  overflow-y: auto;
+  background: white;
+  border: 1px solid #c9d3ce;
+  border-radius: 15px;
+  box-shadow: var(--shadow);
+}
+
+.patient-list {
+  overflow: hidden;
+  margin-bottom: 17px;
+  background: white;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+}
+
+.patient-option {
+  display: flex;
+  width: 100%;
+  min-height: 68px;
+  align-items: center;
+  gap: 11px;
+  padding: 10px 13px;
+  text-align: left;
+  background: white;
+  border: 0;
+  cursor: pointer;
+}
+
+.patient-option + .patient-option { border-top: 1px solid var(--line); }
+.patient-option[aria-selected="true"],
+.patient-option:hover { background: var(--forest-50); }
+.patient-option .person-avatar,
+.patient-context .person-avatar,
+.staff-row .person-avatar { width: 42px; height: 42px; color: #6e4938; background: #f0d3c1; }
+.patient-option-copy { min-width: 0; flex: 1; }
+.patient-option-copy strong,
+.patient-option-copy span { display: block; }
+.patient-option-copy strong { overflow: hidden; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.patient-option-copy span { margin-top: 3px; color: var(--muted); font-size: 12px; }
+.empty-suggestion { padding: 16px; color: var(--muted); font-size: 13px; }
+.patient-list-heading { margin-top: 0; }
+
+.add-panel,
+.admin-panel {
+  margin: 17px 0;
+  padding: 0 16px;
+  background: white;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+}
+
+.add-panel summary {
+  display: flex;
+  min-height: 54px;
+  align-items: center;
+  gap: 9px;
+  color: var(--forest-700);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 780;
+  list-style: none;
+}
+.add-panel summary::-webkit-details-marker { display: none; }
+.add-panel summary svg { width: 19px; fill: none; stroke: currentColor; stroke-width: 2; }
+.add-panel .stack-form { margin: 0; padding: 0 0 18px; }
+
+.admin-panel { margin-top: 24px; padding-top: 17px; padding-bottom: 17px; }
+.staff-list { overflow: hidden; margin-bottom: 13px; border: 1px solid var(--line); border-radius: 15px; }
+.staff-row { display: flex; align-items: center; gap: 11px; padding: 11px; }
+.staff-row + .staff-row { border-top: 1px solid var(--line); }
+.staff-row > span:nth-child(2) { min-width: 0; }
+.staff-row strong,
+.staff-row small { display: block; }
+.staff-row strong { font-size: 13px; }
+.staff-row small { margin-top: 3px; overflow-wrap: anywhere; color: var(--muted); font-size: 11px; }
 
 [hidden] {
   display: none !important;
